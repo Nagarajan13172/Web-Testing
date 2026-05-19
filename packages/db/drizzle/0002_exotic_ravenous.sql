@@ -1,0 +1,1 @@
+ALTER TABLE "test_cases" ADD COLUMN "last_run_output" text;
