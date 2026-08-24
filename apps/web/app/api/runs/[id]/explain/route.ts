@@ -9,6 +9,7 @@ import {
   and,
 } from "@webtesting/db";
 import { streamExplainFailure, EXPLAIN_FAILURE_MODEL } from "@webtesting/ai";
+import { requireUser, runBelongsToOrg } from "@/lib/auth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -23,6 +24,13 @@ export async function POST(
 ) {
   const { id: runId } = await params;
   if (!isUuid(runId)) return NextResponse.json({ error: "invalid run id" }, { status: 400 });
+
+  // Without this, any signed-in user can explain any run's failures — leaking
+  // test names and stack traces, and spending our model quota doing it.
+  const { org } = await requireUser();
+  if (!(await runBelongsToOrg(runId, org.id))) {
+    return NextResponse.json({ error: "run not found" }, { status: 404 });
+  }
 
   const body = (await req.json().catch(() => null)) as ExplainBody | null;
   if (!body?.testResultId || !isUuid(body.testResultId)) {

@@ -1,5 +1,5 @@
 import { auth, currentUser } from "@clerk/nextjs/server";
-import { db, users, orgs, eq, type User } from "@webtesting/db";
+import { db, users, orgs, runs, repos, eq, and, type User } from "@webtesting/db";
 
 export interface RequireUserResult {
   user: User;
@@ -44,4 +44,21 @@ export async function requireUser(): Promise<RequireUserResult> {
   const [createdOrg] = await db.insert(orgs).values({ name: "personal", ownerId: user.id }).returning();
   if (!createdOrg) throw new Error("failed to create org row");
   return { user, org: createdOrg };
+}
+
+/**
+ * True when `runId` belongs to a repo owned by `orgId`.
+ *
+ * Run-scoped routes must call this: middleware only proves the caller is
+ * signed in, and knowing a run UUID is not authorization on its own. Callers
+ * should 404 rather than 403 on a false so they don't confirm the run exists.
+ */
+export async function runBelongsToOrg(runId: string, orgId: string): Promise<boolean> {
+  const [row] = await db
+    .select({ id: runs.id })
+    .from(runs)
+    .innerJoin(repos, eq(runs.repoId, repos.id))
+    .where(and(eq(runs.id, runId), eq(repos.orgId, orgId)))
+    .limit(1);
+  return Boolean(row);
 }

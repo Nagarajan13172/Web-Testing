@@ -14,9 +14,12 @@ import {
   testResults,
   repos,
   aiArtifacts,
+  coverage,
   eq,
+  and,
   asc,
 } from "@webtesting/db";
+import { requireUser } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
 
@@ -33,6 +36,8 @@ export default async function RunDetailPage({ params, searchParams }: PageProps)
   const sp = await searchParams;
   if (!isUuid(id)) notFound();
 
+  const { org } = await requireUser();
+
   const [row] = await db
     .select({
       run: runs,
@@ -40,20 +45,30 @@ export default async function RunDetailPage({ params, searchParams }: PageProps)
       repoName: repos.name,
     })
     .from(runs)
-    .leftJoin(repos, eq(runs.repoId, repos.id))
-    .where(eq(runs.id, id))
+    // Scoped to the caller's org — a run UUID alone must not grant access to
+    // another org's steps, test names, failure stacks or coverage.
+    .innerJoin(repos, eq(runs.repoId, repos.id))
+    .where(and(eq(runs.id, id), eq(repos.orgId, org.id)))
     .limit(1);
 
+  // 404 rather than 403 so we don't confirm the run exists.
   if (!row) notFound();
 
-  const [steps, tests, artifacts] = await Promise.all([
+  const [steps, tests, artifacts, coverageRows] = await Promise.all([
     db.select().from(runSteps).where(eq(runSteps.runId, id)).orderBy(asc(runSteps.startedAt)),
     db.select().from(testResults).where(eq(testResults.runId, id)),
     db
       .select()
       .from(aiArtifacts)
       .where(eq(aiArtifacts.runId, id)),
+    db.select().from(coverage).where(eq(coverage.runId, id)),
   ]);
+
+  const coverageTotal = coverageRows.length === 0 ? null : (() => {
+    const total = coverageRows.reduce((acc, r) => acc + r.linesTotal, 0);
+    const covered = coverageRows.reduce((acc, r) => acc + r.linesCovered, 0);
+    return total === 0 ? 0 : Math.round((covered / total) * 100);
+  })();
 
   const explanations: Record<string, string> = {};
   for (const a of artifacts) {
@@ -87,6 +102,14 @@ export default async function RunDetailPage({ params, searchParams }: PageProps)
     { id: "unit", label: "Unit", badge: badgeFor(totals.unit) },
     { id: "integration", label: "Integration", badge: badgeFor(totals.integration) },
     { id: "e2e", label: "E2E", badge: badgeFor(totals.e2e) },
+    {
+      id: "coverage",
+      label: "Coverage",
+      badge:
+        coverageTotal == null
+          ? null
+          : { text: `${coverageTotal}%`, tone: coverageTotal >= 80 ? "success" : coverageTotal >= 50 ? "muted" : "destructive" },
+    },
     { id: "steps", label: "Steps", badge: { text: String(steps.length), tone: "muted" } },
   ];
 
@@ -165,10 +188,89 @@ export default async function RunDetailPage({ params, searchParams }: PageProps)
             explanations={explanations}
           />
         )}
+        {active === "coverage" && (
+          <CoverageView rows={coverageRows} totalPct={coverageTotal} />
+        )}
         {active === "steps" && <StepsTable steps={steps} />}
       </div>
     </AppShell>
   );
+}
+
+interface CoverageRow {
+  id: string;
+  runId: string;
+  file: string;
+  linesTotal: number;
+  linesCovered: number;
+  pct: number;
+}
+
+function CoverageView({ rows, totalPct }: { rows: CoverageRow[]; totalPct: number | null }) {
+  if (rows.length === 0) {
+    return (
+      <div className="rounded-lg border border-dashed border-border bg-card/30 px-6 py-12 text-center text-sm text-muted-foreground">
+        No coverage data recorded for this run.
+      </div>
+    );
+  }
+  // Lowest coverage first so the user sees the worst-covered files first.
+  const sorted = [...rows].sort((a, b) => a.pct - b.pct);
+  const totalLines = rows.reduce((acc, r) => acc + r.linesTotal, 0);
+  const coveredLines = rows.reduce((acc, r) => acc + r.linesCovered, 0);
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center justify-between gap-4 rounded-lg border border-border bg-card/40 p-4">
+        <div>
+          <div className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+            Total line coverage
+          </div>
+          <div className="mt-1 font-mono text-3xl font-semibold text-foreground">{totalPct ?? 0}%</div>
+        </div>
+        <div className="font-mono text-xs text-muted-foreground">
+          {coveredLines} / {totalLines} lines · {rows.length} files
+        </div>
+      </div>
+      <div className="overflow-hidden rounded-lg border border-border bg-card/40">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="border-b border-border bg-muted/30 text-left text-[11px] uppercase tracking-wider text-muted-foreground">
+              <th className="px-4 py-2.5 font-medium">File</th>
+              <th className="px-4 py-2.5 font-medium">Coverage</th>
+              <th className="px-4 py-2.5 font-medium text-right">Lines</th>
+            </tr>
+          </thead>
+          <tbody>
+            {sorted.map((r) => (
+              <tr key={r.id} className="border-b border-border/60 last:border-b-0">
+                <td className="px-4 py-2 font-mono text-xs text-foreground">{r.file}</td>
+                <td className="px-4 py-2">
+                  <div className="flex items-center gap-2">
+                    <div className="h-1.5 w-32 overflow-hidden rounded-full bg-muted/40">
+                      <div
+                        className={`h-full ${barColor(r.pct)}`}
+                        style={{ width: `${Math.min(100, Math.max(0, r.pct))}%` }}
+                      />
+                    </div>
+                    <span className="font-mono text-xs text-muted-foreground">{r.pct}%</span>
+                  </div>
+                </td>
+                <td className="px-4 py-2 text-right font-mono text-xs text-muted-foreground">
+                  {r.linesCovered} / {r.linesTotal}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function barColor(pct: number): string {
+  if (pct >= 80) return "bg-success";
+  if (pct >= 50) return "bg-warning";
+  return "bg-destructive";
 }
 
 function bucketByKind(rows: TestRowWithKind[]) {

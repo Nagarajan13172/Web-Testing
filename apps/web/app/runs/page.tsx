@@ -2,10 +2,13 @@ import Link from "next/link";
 import { AppShell } from "@/components/app-shell";
 import { RunStatusPill, type RunStatus } from "@/components/run-status-pill";
 import { db, runs, repos, eq, desc } from "@webtesting/db";
+import { requireUser } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
 
 export default async function RunsPage() {
+  const { org } = await requireUser();
+
   const rows = await db
     .select({
       id: runs.id,
@@ -20,7 +23,9 @@ export default async function RunsPage() {
       repoName: repos.name,
     })
     .from(runs)
-    .leftJoin(repos, eq(runs.repoId, repos.id))
+    // innerJoin + org filter: this list is scoped to the caller's own repos.
+    .innerJoin(repos, eq(runs.repoId, repos.id))
+    .where(eq(repos.orgId, org.id))
     .orderBy(desc(runs.createdAt))
     .limit(100);
 
@@ -29,7 +34,7 @@ export default async function RunsPage() {
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">Runs</h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          The last 100 runs across all repositories.
+          The last 100 runs across your repositories.
         </p>
       </div>
 

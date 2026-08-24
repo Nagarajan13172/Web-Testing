@@ -1,4 +1,5 @@
 import { Redis } from "ioredis";
+import { requireUser, runBelongsToOrg } from "@/lib/auth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -12,6 +13,12 @@ export async function GET(
   const { id } = await params;
   if (!isUuid(id)) {
     return new Response("invalid run id", { status: 400 });
+  }
+
+  // Being signed in isn't enough — this streams another org's run otherwise.
+  const { org } = await requireUser();
+  if (!(await runBelongsToOrg(id, org.id))) {
+    return new Response("not found", { status: 404 });
   }
 
   const channel = `run-events:${id}`;
