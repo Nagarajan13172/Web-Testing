@@ -91,6 +91,28 @@ CODE REQUIREMENTS:
 - DO NOT wrap render() output or user interactions in \`act(...)\`. React Testing Library already wraps these for you; explicit \`act\` calls produce console warnings.
 - Keep specs under ~40 lines.
 
+PROVIDER CONTEXT (check this BEFORE writing any spec — a component that needs a
+provider throws the moment it is rendered bare, and no assertion is ever reached):
+Trace the app's root before you choose what to test: the entry (src/index.tsx,
+src/main.tsx, app/layout.tsx) and whatever it delegates to (App.tsx, Root.tsx,
+Providers.tsx). Note EVERY wrapper around the tree — UI-kit roots, theme
+providers, query clients, store providers, SDK providers.
+- If the component under test sits inside those providers at runtime, wrap it in
+  the SAME providers in the test, imported from the same packages.
+- A provider that needs a runtime you don't have under Vitest (a native SDK, a
+  wallet connector, a device bridge) should be mocked with vi.mock rather than
+  rendered for real.
+- Hooks that read a platform or session environment — launch params, device
+  info, auth state, reactive signals — throw outside that environment. Mock the
+  module that exports them:
+  \`vi.mock("<pkg>", () => ({ useThing: () => ({ ... }) }));\`
+  When a hook returns a reactive object (a signal/store), the mock must return
+  something with the same shape the component uses, not a bare value.
+- PREFER COMPONENTS THAT MOUNT CHEAPLY. A presentational component with props
+  beats a screen wired into three providers. If a component can only run under a
+  provider stack you cannot reasonably reproduce, pick a different component —
+  a spec that always throws on render is worth nothing.
+
 QUERY PRIORITY (per Testing Library — pick the highest-priority query that fits):
 1. \`getByRole(role, { name: /.../i })\` — first choice for any element with an accessible name (headings, buttons, links, form fields, regions).
 2. \`getByLabelText(/.../i)\` — for form inputs associated with a label.

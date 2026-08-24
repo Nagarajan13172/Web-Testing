@@ -114,12 +114,32 @@ function pickCandidates(tree: string[]): string[] {
 
   // Up to 25 component files — the AI needs to read enough source to produce
   // assertions that match the actual rendered text (not abbreviated guesses).
+  // Ordered before slicing so the cap drops the least useful files: root and
+  // provider components go first (without them the model can't see what wraps
+  // the tree, and writes specs that throw on render), vendored UI primitives
+  // last (a shadcn ui/ folder is ~48 files and would otherwise eat every slot).
   const components = tree
     .filter((p) => /^(src\/)?components\/.+\.(tsx?|jsx?)$/.test(p))
+    .sort((a, b) => componentRank(a) - componentRank(b))
     .slice(0, 25);
   for (const p of components) set.add(p);
 
   return [...set];
+}
+
+/**
+ * Sort key for component candidates — lower is kept first when the cap bites.
+ * Array.prototype.sort is stable, so files of equal rank keep tree order.
+ */
+function componentRank(path: string): number {
+  const base = path.split("/").pop() ?? "";
+  // Establishes the provider stack — the model needs this to know what to wrap
+  // a component in, and it's useless to test in isolation itself.
+  if (/^(Root|App|Providers?|Layout|Shell)\.(tsx?|jsx?)$/i.test(base)) return 0;
+  // Vendored primitives (shadcn/ui and friends): rarely what anyone wants
+  // tested, and numerous enough to crowd out the app's real components.
+  if (/(^|\/)ui\//.test(path)) return 2;
+  return 1;
 }
 
 function notNoise(p: string): boolean {
