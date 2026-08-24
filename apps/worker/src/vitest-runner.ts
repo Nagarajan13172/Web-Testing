@@ -23,11 +23,21 @@ import type { Logger } from "./orchestrator";
 const VITEST_IMAGE = process.env.VITEST_IMAGE ?? "webtesting/node:latest";
 const JOB_TIMEOUT_MS = Number(process.env.VITEST_TIMEOUT_MS ?? 15 * 60_000);
 
-/** Deliberately not `vitest.config.ts` — see writeVitestConfig. */
-const VITEST_CONFIG_FILENAME = "vitest.webtesting.config.ts";
+/**
+ * Deliberately not `vitest.config.ts` — see writeVitestConfig.
+ *
+ * The `.mts` extension is load-bearing: it forces the config to be loaded as
+ * ESM. With a plain `.ts` name, a repo without `"type": "module"` gets it
+ * loaded through `require`, and the ESM-only `vite-tsconfig-paths` we depend on
+ * then fails the whole run with "ESM file cannot be loaded by require".
+ */
+const VITEST_CONFIG_FILENAME = "vitest.webtesting.config.mts";
 
 /** Printed inside the container when a dependency install fails. */
 const INSTALL_FAILED_MARKER = "WEBTESTING_INSTALL_FAILED:";
+
+/** Printed when the first install failed but the looser peer resolver worked. */
+const PEER_RETRY_NOTE = "WEBTESTING_INSTALL_RETRIED_LOOSE_PEERS:";
 
 /**
  * How many times a failing spec may be sent back to the model to be fixed
@@ -335,14 +345,19 @@ interface SuiteOutcome {
  */
 async function runSuite(args: RunSuiteArgs): Promise<SuiteOutcome> {
   const { workdir, repoDir, runId, attempt, log } = args;
-  const installCmd = installCommand(repoDir);
+  const repoInstall = installCommands(repoDir);
+  // @testing-library/dom is a peer of @testing-library/react and must be named
+  // explicitly: when the repo install falls back to loose peer resolution, npm
+  // stops pulling peers in automatically and react's dist/pure.js dies with
+  // "Cannot find module '@testing-library/dom'" on every single spec.
   const extraDeps =
-    "vitest@^2 @vitest/coverage-v8@^2 happy-dom@^15 @testing-library/react@^16 @testing-library/jest-dom@^6 @testing-library/user-event@^14 @vitejs/plugin-react@^4 vite-tsconfig-paths@^5";
+    "vitest@^2 @vitest/coverage-v8@^2 happy-dom@^15 @testing-library/react@^16 @testing-library/dom@^10 @testing-library/jest-dom@^6 @testing-library/user-event@^14 @vitejs/plugin-react@^4 vite-tsconfig-paths@^5";
+  const testDepsInstall = `npm install --no-audit --no-fund -D ${extraDeps}`;
 
   const script = [
     `cd /work/repo`,
-    installStep(installCmd, "repo dependencies"),
-    installStep(`npm install --no-audit --no-fund -D ${extraDeps}`, "test dependencies"),
+    installStep(repoInstall.command, "repo dependencies", repoInstall.retry),
+    installStep(testDepsInstall, "test dependencies", `${testDepsInstall} --legacy-peer-deps`),
     // Diagnostic: list what we're about to run, so future failures are easier to debug.
     `echo "=== files in tests/ai ===" && ls -la /work/repo/tests/ai/ || true`,
     // Drop --dir (it double-scopes the include glob) and let the config drive discovery.
@@ -560,18 +575,43 @@ async function markAllFailed(
  * would mask the install's exit status and the container's /bin/sh (dash) has
  * no `pipefail`.
  */
-function installStep(command: string, label: string): string {
+function installStep(command: string, label: string, retryCommand?: string): string {
   const logFile = `/tmp/install-${label.replace(/\W+/g, "-")}.log`;
+  const onFailure = `tail -50 ${logFile}; echo "${INSTALL_FAILED_MARKER} ${label}"`;
+  if (!retryCommand) {
+    return `{ if ${command} > ${logFile} 2>&1; then tail -20 ${logFile}; else ${onFailure}; fi; }`;
+  }
   return (
     `{ if ${command} > ${logFile} 2>&1; then tail -20 ${logFile}; ` +
-    `else tail -50 ${logFile}; echo "${INSTALL_FAILED_MARKER} ${label}"; fi; }`
+    `elif ${retryCommand} > ${logFile} 2>&1; then echo "${PEER_RETRY_NOTE} ${label}"; tail -20 ${logFile}; ` +
+    `else ${onFailure}; fi; }`
   );
 }
 
-function installCommand(repoDir: string): string {
-  if (existsSync(join(repoDir, "pnpm-lock.yaml"))) return "pnpm install --frozen-lockfile=false";
-  if (existsSync(join(repoDir, "yarn.lock"))) return "yarn install --frozen-lockfile=false";
-  return "npm install --no-audit --no-fund";
+/**
+ * The install command for the repo, plus a fallback to retry with if the first
+ * attempt fails.
+ *
+ * Modern npm aborts on any unsatisfiable peer range (ERESOLVE), which a lot of
+ * real repos have — they were installed with an older npm, or with a lockfile
+ * we're deliberately not honouring. Those repos aren't broken, they just need
+ * the looser resolver, so a peer conflict shouldn't cost the whole run.
+ */
+function installCommands(repoDir: string): { command: string; retry?: string } {
+  if (existsSync(join(repoDir, "pnpm-lock.yaml"))) {
+    return {
+      command: "pnpm install --frozen-lockfile=false",
+      retry: "pnpm install --frozen-lockfile=false --no-strict-peer-dependencies",
+    };
+  }
+  if (existsSync(join(repoDir, "yarn.lock"))) {
+    // Yarn v1 treats peer mismatches as warnings, so there's nothing to loosen.
+    return { command: "yarn install --frozen-lockfile=false" };
+  }
+  return {
+    command: "npm install --no-audit --no-fund",
+    retry: "npm install --no-audit --no-fund --legacy-peer-deps",
+  };
 }
 
 /**

@@ -225,6 +225,41 @@ export async function generateTests(input: GenerateTestsInput): Promise<Generate
   };
 }
 
+/**
+ * Per-framework corrections to the base prompt.
+ *
+ * The base prompt's routing rules are written for React Router, which is right
+ * for Vite/CRA apps and actively wrong for Next.js — left to itself the model
+ * imports react-router-dom into a Next app and every spec dies at
+ * "Failed to resolve import".
+ */
+function frameworkGuidance(framework: string | null | undefined): string | null {
+  if (!framework) return null;
+
+  if (framework.startsWith("next")) {
+    return `## Framework rules for THIS repo (Next.js) — these override the routing rules above
+- This app does NOT use React Router. NEVER import react-router-dom, and never
+  wrap anything in MemoryRouter / BrowserRouter / HashRouter.
+- Routing comes from next/link and next/navigation. When a component calls
+  useRouter, usePathname, useParams or useSearchParams, mock the module:
+  vi.mock("next/navigation", () => ({ useRouter: () => ({ push: vi.fn(), replace: vi.fn(), back: vi.fn() }), usePathname: () => "/", useSearchParams: () => new URLSearchParams() }));
+- App Router pages and layouts are often async Server Components. React Testing
+  Library cannot render those. Prefer components marked "use client", and plain
+  presentational components, over route files.
+- Do not test anything that reads the filesystem or a database at module scope.`;
+  }
+
+  if (framework === "remix") {
+    return `## Framework rules for THIS repo (Remix) — these override the routing rules above
+- Remix has its own router. Do not import react-router-dom directly; if a
+  component uses Remix hooks (useLoaderData, useNavigate), mock "@remix-run/react".
+- Prefer plain presentational components over route modules, which expect a
+  loader context that does not exist under Vitest.`;
+  }
+
+  return null;
+}
+
 function buildPrompt(input: GenerateTestsInput): string {
   const treePreview = input.fileTree.slice(0, 400).join("\n");
   const filesBlock = input.files
@@ -233,6 +268,11 @@ function buildPrompt(input: GenerateTestsInput): string {
 
   const lines: string[] = [`Repository: ${input.repoFullName}`];
   if (input.framework) lines.push(`Framework: ${input.framework}`);
+  const frameworkNotes = frameworkGuidance(input.framework);
+  if (frameworkNotes) {
+    lines.push("");
+    lines.push(frameworkNotes);
+  }
   lines.push("");
   lines.push(`## File tree (up to 400 entries)`);
   lines.push(treePreview);
