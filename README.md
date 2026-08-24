@@ -1,25 +1,56 @@
 # webtesting
 
-CI that runs your tests **and writes the ones you don't have yet**. Connect a GitHub repo, get lint + build + AI-generated tests + AI review on every push.
-
-See the full plan at [`/Users/nagarajan/.claude/plans/hi-buddy-i-need-swirling-donut.md`](../../.claude/plans/hi-buddy-i-need-swirling-donut.md).
+Connect a GitHub repo and get AI-written tests for it. The platform reads your
+React source, generates Vitest + React Testing Library specs with Gemini, runs
+them in a Docker sandbox, and reports per-case results, failure explanations
+and line coverage.
 
 ## Stack
 
 | | |
 |---|---|
 | Web | Next.js 15 (App Router) + TypeScript + Tailwind + shadcn/ui |
-| Auth | _Deferred_ — will plug in Clerk (or alternative) once core CI logic works |
+| Auth | Clerk (wired — GitHub social connection) |
 | DB | Postgres 16 via Docker Compose |
 | Queue | BullMQ on Redis 7 via Docker Compose |
 | ORM | Drizzle |
-| AI | Anthropic Claude API |
+| AI | Google Gemini (`gemini-2.5-flash`) |
+| Sandbox | Docker (`webtesting/node:latest`) |
+
+## What works today
+
+- **GitHub App install** → repos synced into the dashboard (webhook signature verified).
+- **Framework detection** — deterministic, reads `package.json`. No AI cost.
+- **AI test generation** — 6–10 Vitest + RTL cases per repo, stored as editable test cases.
+- **Sandboxed runs** — clone → inject specs under `tests/ai/` → run in Docker → parse
+  JUnit back to per-case pass/fail with failure messages and stack traces.
+- **Coverage** — v8 line coverage per file, shown on the run detail page.
+- **AI failure explanation** — streamed onto failing tests on the run detail page.
+- **Legacy push pipeline** — `apps/worker/src/orchestrator.ts` still runs the original
+  install/lint/typecheck/test pipeline for `git-push` jobs from the webhook.
+
+### Supported repos
+
+React only, and detection gates on it: `next-app`, `next-pages`, `vite-react`, `cra`,
+`remix`. Anything else is detected and reported, but generation and runs are refused.
+
+### Not built yet
+
+- **Browser / E2E tests** — Vitest in happy-dom only. There is no Playwright runner.
+- **PR creation** — nothing opens a PR with the generated tests.
+- **AI diff review** — changed code is not reviewed.
+- **Secrets vault** — the `secrets` table and `SECRET_VAULT_KEY` exist; there is no code.
+- **Python / Java / Go** — JS/TS only.
+
+Earlier drafts of a Playwright runner, a PR-opening helper and a diff reviewer were
+removed rather than left in place unwired — they described capabilities the platform
+did not have. They're in git history if you want them back.
 
 ## Prerequisites
 
 - Node 20+ (`nvm use`)
 - pnpm 9+
-- Docker Desktop
+- Docker Desktop (required — runs both the datastores and the test sandbox)
 
 ## First-time setup
 
@@ -30,22 +61,28 @@ pnpm install
 # 2. Bring up Postgres + Redis
 docker compose up -d
 
-# 3. Copy env template (auth is deferred — no third-party keys needed yet)
+# 3. Configure env (see .env.example for what each key is for)
 cp .env.example apps/web/.env.local
 
 # 4. Apply database migrations
 pnpm db:generate   # writes packages/db/drizzle/ from schema.ts
 pnpm db:migrate    # applies migrations to local Postgres
 
-# 5. Start the dev server
+# 5. Build the sandbox image the test runner executes in
+pnpm sandbox:build
+
+# 6. Start the dev server
 pnpm dev           # Next.js at http://localhost:3000
 ```
 
-In a second terminal once MVP step 3 ships:
+In a second terminal:
 
 ```bash
-pnpm worker        # BullMQ worker
+pnpm worker        # BullMQ worker — required for any test run
 ```
+
+`GEMINI_API_KEY` is required for test generation and failure explanation. The
+Clerk and GitHub App keys are required for sign-in and repo sync respectively.
 
 ## Layout
 
@@ -53,13 +90,17 @@ pnpm worker        # BullMQ worker
 .
 ├── apps/
 │   ├── web/                 # Next.js app + API routes
-│   └── worker/              # BullMQ worker (stub until step 3)
+│   └── worker/              # BullMQ worker
+│       └── src/
+│           ├── vitest-runner.ts    # the AI test-case path (current product)
+│           └── orchestrator.ts     # the legacy git-push CI path
 ├── packages/
 │   ├── db/                  # Drizzle schema + migrations
-│   ├── detector/            # Language detection (stub)
-│   ├── runners/             # Per-language pipelines (stub)
-│   ├── junit-parser/        # JUnit XML → typed rows (stub)
-│   └── ai/                  # Claude wrappers (stub)
+│   ├── ai/                  # Gemini wrappers + generated-code sanitizers
+│   ├── detector/            # Language detection (legacy path)
+│   ├── runners/             # Per-language pipelines (legacy path)
+│   └── junit-parser/        # JUnit XML → typed rows
+├── docker/node.Dockerfile   # sandbox image
 ├── docker-compose.yml       # Postgres + Redis for local dev
 └── tsconfig.base.json
 ```
@@ -69,22 +110,25 @@ pnpm worker        # BullMQ worker
 | Command | What it does |
 |---|---|
 | `pnpm dev` | Start Next.js dev server |
+| `pnpm worker` | Start the BullMQ worker |
 | `pnpm build` | Production build of the web app |
-| `pnpm worker` | Start the BullMQ worker (once implemented) |
+| `pnpm test` | Run unit tests across packages |
+| `pnpm typecheck` | Typecheck every workspace package |
 | `pnpm db:generate` | Generate SQL migrations from `packages/db/src/schema.ts` |
 | `pnpm db:migrate` | Apply migrations to `$DATABASE_URL` |
 | `pnpm db:studio` | Open Drizzle Studio |
-| `pnpm typecheck` | Typecheck every workspace package |
+| `pnpm sandbox:build` | Build the Node sandbox image used for test runs |
 
-## Where we are in the MVP
+## Notes for contributors
 
-- [x] **Step 0** — Docker Compose for Postgres + Redis
-- [x] **Step 1** — Monorepo skeleton, Next.js app, Clerk wiring, Drizzle schema, landing / dashboard / repo-detail shells
-- [ ] **Step 2** — GitHub App install flow + webhook
-- [ ] **Step 3** — Worker + BullMQ
-- [ ] **Step 4** — JS/TS end-to-end: clone → vitest → JUnit parse → run-detail UI
-- [ ] **Step 5** — Secrets vault
-- [ ] **Step 6–8** — AI explain / generate / review
-- [ ] **Step 9–10** — Python, Java, Go support
+**Generated-code sanitizers.** The model reliably produces a few broken patterns
+(nested `<Router>`, wrong relative import depth, `getByText` on text split across
+elements). `packages/ai/src/sanitize.ts` is the single source of truth for those
+rewrites — it runs at generation time *and* again in the worker, so cases stored
+before a rewrite existed heal on their next run. Every rewrite must stay
+idempotent; `pnpm test` enforces that.
 
-Follow-up prompts to drive each step live at the bottom of the plan file.
+**Vitest config.** The runner always writes its own `vitest.webtesting.config.ts`
+into the clone and passes `--config` explicitly, so a config shipped by the target
+repo can neither shadow it nor be clobbered. `coverage.reportOnFailure` must stay
+`true` — Vitest discards the whole coverage report on any test failure otherwise.

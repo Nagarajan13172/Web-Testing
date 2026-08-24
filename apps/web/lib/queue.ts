@@ -15,8 +15,7 @@ export type RunJob =
       kind: "test-cases";
       repoId: string;
       testCaseIds: string[];
-      runnerKind: "vitest" | "playwright";
-      targetDomain?: string | null;
+      runnerKind: "vitest";
     };
 
 const redisUrl = process.env.REDIS_URL ?? "redis://localhost:6379";
