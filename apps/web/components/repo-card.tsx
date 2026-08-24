@@ -9,13 +9,10 @@ import {
   Sparkles,
   Play,
   Settings,
-  Link as LinkIcon,
-  Save,
   ListChecks,
   ListMinus,
   ListPlus,
   TrendingUp,
-  AlertTriangle,
   Search,
   Box,
 } from "lucide-react";
@@ -43,7 +40,16 @@ interface InitialPayload {
   totals: { total: number; passed: number; failed: number; running: number; pending: number };
   framework?: string | null;
   testRunnerKind?: "vitest" | "playwright" | null;
+  supported?: boolean | null;
 }
+
+const SUPPORTED_FRAMEWORKS = new Set([
+  "next-app",
+  "next-pages",
+  "vite-react",
+  "cra",
+  "remix",
+]);
 
 export interface RepoCardProps {
   repoId: string;
@@ -56,14 +62,10 @@ export interface RepoCardProps {
 export function RepoCard({ repoId, repoFullName, defaultBranch, initial, installed }: RepoCardProps) {
   const [open, setOpen] = useState(initial.cases.length > 0);
   const [data, setData] = useState<InitialPayload>(initial);
-  const [targetInput, setTargetInput] = useState(initial.targetDomain ?? "");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [generating, startGen] = useTransition();
   const [genError, setGenError] = useState<string | null>(null);
-  const [running, setRunning] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
-  const [domainSaving, setDomainSaving] = useState(false);
-  const [domainError, setDomainError] = useState<string | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
   const [modalCaseIds, setModalCaseIds] = useState<string[]>([]);
   const [detecting, setDetecting] = useState(false);
@@ -71,6 +73,9 @@ export function RepoCard({ repoId, repoFullName, defaultBranch, initial, install
   const [detectHint, setDetectHint] = useState<string | null>(null);
   const autoDetectedRef = useRef(false);
   const [editingCase, setEditingCase] = useState<EditableCase | null>(null);
+
+  const isSupported =
+    data.framework == null ? null : SUPPORTED_FRAMEWORKS.has(data.framework);
 
   // Auto-detect framework the first time the user opens this card if it
   // hasn't been detected yet. No AI cost — just reads package.json.
@@ -126,7 +131,6 @@ export function RepoCard({ repoId, repoFullName, defaultBranch, initial, install
         if (refreshed.ok) {
           const next = (await refreshed.json()) as InitialPayload;
           setData(next);
-          if (next.targetDomain && !targetInput) setTargetInput(next.targetDomain);
           setOpen(true);
         }
       } catch (err) {
@@ -155,34 +159,10 @@ export function RepoCard({ repoId, repoFullName, defaultBranch, initial, install
     }
   }
 
-  async function saveDomain() {
-    setDomainError(null);
-    setDomainSaving(true);
-    try {
-      const res = await fetch(`/api/repos/${repoId}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ targetDomain: targetInput.trim() || null }),
-      });
-      const json = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(json.error ?? `request failed: ${res.status}`);
-      setData((d) => ({ ...d, targetDomain: targetInput.trim() || null }));
-    } catch (err) {
-      setDomainError(err instanceof Error ? err.message : "unknown error");
-    } finally {
-      setDomainSaving(false);
-    }
-  }
-
   function runSelected() {
     setRunError(null);
     const ids = [...selected];
     if (ids.length === 0) return;
-    // Playwright runner needs a deployed URL; Vitest runs against components, no URL required.
-    if (data.testRunnerKind !== "vitest" && !data.targetDomain) {
-      setRunError("Set a Target Domain first.");
-      return;
-    }
     setModalCaseIds(ids);
     setModalOpen(true);
     setSelected(new Set());
@@ -258,21 +238,9 @@ export function RepoCard({ repoId, repoFullName, defaultBranch, initial, install
             </div>
             <label className="shrink-0 text-xs font-medium text-muted-foreground">Framework</label>
             {data.framework ? (
-              <>
-                <span className="inline-flex items-center gap-1.5 rounded-md border border-border bg-muted/30 px-2 py-0.5 font-mono text-[11px] text-foreground">
-                  {data.framework}
-                </span>
-                <span
-                  className={cn(
-                    "inline-flex items-center gap-1.5 rounded-md px-2 py-0.5 font-mono text-[11px]",
-                    data.testRunnerKind === "vitest"
-                      ? "bg-primary/15 text-primary"
-                      : "bg-warning/15 text-warning",
-                  )}
-                >
-                  {data.testRunnerKind === "vitest" ? "Vitest runner" : "Playwright runner"}
-                </span>
-              </>
+              <span className="inline-flex items-center gap-1.5 rounded-md border border-border bg-muted/30 px-2 py-0.5 font-mono text-[11px] text-foreground">
+                {data.framework}
+              </span>
             ) : (
               <span className="text-xs text-muted-foreground">Not detected yet</span>
             )}
@@ -298,105 +266,71 @@ export function RepoCard({ repoId, repoFullName, defaultBranch, initial, install
           )}
         </div>
 
-        {/* Target Domain — only relevant for Playwright */}
-        {data.testRunnerKind !== "vitest" && (
-          <div className="mt-3 rounded-md border border-border bg-background/40 px-3 py-2">
-            <div className="flex items-center gap-3">
-              <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-muted/40 text-muted-foreground">
-                <LinkIcon className="h-3.5 w-3.5" strokeWidth={1.75} />
-              </div>
-              <label className="shrink-0 text-xs font-medium text-muted-foreground">
-                Target Domain
-              </label>
-              <input
-                value={targetInput}
-                onChange={(e) => setTargetInput(e.target.value)}
-                placeholder="http://localhost:3000"
-                className="flex-1 rounded-md border border-input bg-background px-2.5 py-1 font-mono text-xs text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-2 focus:ring-ring"
-              />
-              <button
-                type="button"
-                onClick={saveDomain}
-                disabled={domainSaving || targetInput === (data.targetDomain ?? "")}
-                className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1 text-xs text-foreground transition-colors hover:bg-muted disabled:opacity-50"
-              >
-                {domainSaving ? (
-                  <Loader2 className="h-3 w-3 animate-spin" strokeWidth={1.75} />
-                ) : (
-                  <Save className="h-3 w-3" strokeWidth={1.75} />
-                )}
-                Save
-              </button>
-            </div>
-            {domainError && (
-              <p className="mt-2 font-mono text-[11px] text-destructive">{domainError}</p>
-            )}
-          </div>
-        )}
-
-        {/* Stats */}
-        <div className="mt-5 grid grid-cols-2 gap-3 md:grid-cols-4">
-          <StatCard label="Total tests" value={data.totals.total.toString()} Icon={ListChecks} tone="muted" />
-          <StatCard label="Passed" value={data.totals.passed.toString()} Icon={CheckCircle2} tone="success" />
-          <StatCard label="Failed" value={data.totals.failed.toString()} Icon={XCircle} tone="destructive" />
-          <StatCard label="Pass rate" value={`${passRate}%`} Icon={TrendingUp} tone="primary" />
-        </div>
-
-        {/* Body */}
-        {data.cases.length === 0 ? (
-          <GenerateBlock
-            installed={installed}
-            generating={generating}
-            error={genError}
-            onGenerate={generate}
-          />
+        {/* Unsupported framework — block generate/run, show notice */}
+        {isSupported === false ? (
+          <UnsupportedBlock framework={data.framework ?? "unknown"} />
         ) : (
-          <CaseList
-            cases={data.cases}
-            selected={selected}
-            onToggleAll={toggleAll}
-            onToggleOne={toggleOne}
-            onRun={runSelected}
-            onRegenerate={generate}
-            onEdit={async (c) => {
-              // Open the dialog immediately with what we have; then fetch the
-              // full record (incl. playwrightCode, which is omitted from the
-              // dashboard's initial SSR payload) and patch it in.
-              setEditingCase({
-                id: c.id,
-                title: c.title,
-                description: c.description,
-                category: c.category,
-                targetRoute: c.targetRoute ?? null,
-                expectedResult: c.expectedResult ?? null,
-                playwrightCode: c.playwrightCode ?? "",
-              });
-              try {
-                const res = await fetch(`/api/repos/${repoId}/test-cases`, { cache: "no-store" });
-                if (!res.ok) return;
-                const json = (await res.json()) as {
-                  cases: (InitialCase & { playwrightCode?: string })[];
-                };
-                const fresh = json.cases.find((x) => x.id === c.id);
-                if (!fresh) return;
-                setEditingCase({
-                  id: fresh.id,
-                  title: fresh.title,
-                  description: fresh.description,
-                  category: fresh.category,
-                  targetRoute: fresh.targetRoute ?? null,
-                  expectedResult: fresh.expectedResult ?? null,
-                  playwrightCode: fresh.playwrightCode ?? "",
-                });
-              } catch {
-                /* dialog still works with what we had */
-              }
-            }}
-            generating={generating}
-            running={running}
-            runError={runError}
-            targetSet={data.testRunnerKind === "vitest" || Boolean(data.targetDomain)}
-          />
+          <>
+            {/* Stats */}
+            <div className="mt-5 grid grid-cols-2 gap-3 md:grid-cols-4">
+              <StatCard label="Total tests" value={data.totals.total.toString()} Icon={ListChecks} tone="muted" />
+              <StatCard label="Passed" value={data.totals.passed.toString()} Icon={CheckCircle2} tone="success" />
+              <StatCard label="Failed" value={data.totals.failed.toString()} Icon={XCircle} tone="destructive" />
+              <StatCard label="Pass rate" value={`${passRate}%`} Icon={TrendingUp} tone="primary" />
+            </div>
+
+            {/* Body */}
+            {data.cases.length === 0 ? (
+              <GenerateBlock
+                installed={installed}
+                generating={generating}
+                error={genError}
+                onGenerate={generate}
+              />
+            ) : (
+              <CaseList
+                cases={data.cases}
+                selected={selected}
+                onToggleAll={toggleAll}
+                onToggleOne={toggleOne}
+                onRun={runSelected}
+                onRegenerate={generate}
+                onEdit={async (c) => {
+                  setEditingCase({
+                    id: c.id,
+                    title: c.title,
+                    description: c.description,
+                    category: c.category,
+                    targetRoute: c.targetRoute ?? null,
+                    expectedResult: c.expectedResult ?? null,
+                    playwrightCode: c.playwrightCode ?? "",
+                  });
+                  try {
+                    const res = await fetch(`/api/repos/${repoId}/test-cases`, { cache: "no-store" });
+                    if (!res.ok) return;
+                    const json = (await res.json()) as {
+                      cases: (InitialCase & { playwrightCode?: string })[];
+                    };
+                    const fresh = json.cases.find((x) => x.id === c.id);
+                    if (!fresh) return;
+                    setEditingCase({
+                      id: fresh.id,
+                      title: fresh.title,
+                      description: fresh.description,
+                      category: fresh.category,
+                      targetRoute: fresh.targetRoute ?? null,
+                      expectedResult: fresh.expectedResult ?? null,
+                      playwrightCode: fresh.playwrightCode ?? "",
+                    });
+                  } catch {
+                    /* dialog still works with what we had */
+                  }
+                }}
+                generating={generating}
+                runError={runError}
+              />
+            )}
+          </>
         )}
       </div>
     </details>
@@ -471,7 +405,7 @@ function GenerateBlock({
       </div>
       <h3 className="text-sm font-semibold tracking-tight">Generate AI test cases</h3>
       <p className="mt-1 max-w-sm text-xs text-muted-foreground">
-        Analyze this repository and generate Playwright test cases for the most important user flows.
+        Analyze this repository and generate Vitest + Testing Library tests for your React components.
       </p>
       {installed ? (
         <button
@@ -508,9 +442,7 @@ function CaseList({
   onRegenerate,
   onEdit,
   generating,
-  running,
   runError,
-  targetSet,
 }: {
   cases: InitialCase[];
   selected: Set<string>;
@@ -520,9 +452,7 @@ function CaseList({
   onRegenerate: () => void;
   onEdit: (c: InitialCase) => void;
   generating: boolean;
-  running: boolean;
   runError: string | null;
-  targetSet: boolean;
 }) {
   const allSelected = selected.size === cases.length && cases.length > 0;
   return (
@@ -592,30 +522,37 @@ function CaseList({
           {selected.size === 0
             ? "Select test cases to run."
             : <>Run <span className="font-mono text-foreground">{selected.size}</span> selected test case{selected.size === 1 ? "" : "s"}</>}
-          {!targetSet && (
-            <span className="ml-2 inline-flex items-center gap-1 text-warning">
-              <AlertTriangle className="h-3 w-3" strokeWidth={1.75} />
-              Set a Target Domain first
-            </span>
-          )}
         </div>
         <button
           type="button"
           onClick={onRun}
-          disabled={running || selected.size === 0 || !targetSet}
+          disabled={selected.size === 0}
           className="inline-flex items-center gap-2 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-60"
         >
-          {running ? (
-            <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.75} />
-          ) : (
-            <Play className="h-4 w-4" strokeWidth={1.75} />
-          )}
+          <Play className="h-4 w-4" strokeWidth={1.75} />
           Run test cases
         </button>
       </div>
       {runError && (
         <p className="mt-2 font-mono text-[11px] text-destructive">{runError}</p>
       )}
+    </div>
+  );
+}
+
+function UnsupportedBlock({ framework }: { framework: string }) {
+  return (
+    <div className="mt-5 flex flex-col items-center rounded-md border border-dashed border-border bg-card/30 px-6 py-10 text-center">
+      <div className="mb-3 flex h-10 w-10 items-center justify-center rounded-md border border-border bg-background text-muted-foreground">
+        <Box className="h-4 w-4" strokeWidth={1.5} />
+      </div>
+      <h3 className="text-sm font-semibold tracking-tight">React projects only</h3>
+      <p className="mt-1 max-w-sm text-xs text-muted-foreground">
+        This platform currently generates and runs Vitest + Testing Library tests for React components. Detected: <span className="font-mono text-foreground">{framework}</span>.
+      </p>
+      <p className="mt-3 max-w-sm text-[11px] text-muted-foreground/70">
+        Re-detect after pushing a <span className="font-mono">package.json</span> with <span className="font-mono">react</span> + <span className="font-mono">vite</span> / <span className="font-mono">next</span> / <span className="font-mono">remix</span> / <span className="font-mono">react-scripts</span>.
+      </p>
     </div>
   );
 }

@@ -2,7 +2,6 @@ import { Worker } from "bullmq";
 import { db, runs, testCases, eq, inArray } from "@webtesting/db";
 import { RUNS_QUEUE, connection, type RunJob } from "./queue";
 import { runJob } from "./orchestrator";
-import { runTestCases } from "./test-case-runner";
 import { runVitestCases } from "./vitest-runner";
 
 const worker = new Worker<RunJob>(
@@ -14,25 +13,14 @@ const worker = new Worker<RunJob>(
       console.log(JSON.stringify({ ts: new Date().toISOString(), event, job: tag, ...data }));
 
     if (job.data.kind === "test-cases") {
-      const runner = job.data.runnerKind ?? "playwright";
       log("test-cases picked up", {
         count: job.data.testCaseIds.length,
-        runner,
+        runner: "vitest",
       });
-      if (runner === "vitest") {
-        await runVitestCases(
-          { repoId: job.data.repoId, testCaseIds: job.data.testCaseIds },
-          log,
-        );
-      } else {
-        await runTestCases(
-          {
-            testCaseIds: job.data.testCaseIds,
-            targetDomain: job.data.targetDomain ?? "",
-          },
-          log,
-        );
-      }
+      await runVitestCases(
+        { repoId: job.data.repoId, testCaseIds: job.data.testCaseIds },
+        log,
+      );
       return;
     }
 

@@ -173,7 +173,7 @@ export function EditCaseDialog({ open, onClose, caseData, onSaved }: Props) {
                 className="mb-1.5 inline-flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground transition-colors hover:text-foreground"
               >
                 <Code2 className="h-3 w-3" strokeWidth={1.75} />
-                Test code (advanced — edit directly to override the AI)
+                Vitest test code (advanced — edit directly to override the AI)
                 <ChevronDown
                   className={`h-3 w-3 transition-transform ${showCode ? "rotate-180" : ""}`}
                   strokeWidth={1.75}

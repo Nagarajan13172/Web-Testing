@@ -14,9 +14,23 @@ export type Framework =
 
 export type TestRunnerKind = "vitest" | "playwright";
 
+const SUPPORTED_FRAMEWORKS: Framework[] = [
+  "next-app",
+  "next-pages",
+  "vite-react",
+  "cra",
+  "remix",
+];
+
+export function isSupportedFramework(f: Framework): boolean {
+  return SUPPORTED_FRAMEWORKS.includes(f);
+}
+
 export interface DetectionResult {
   framework: Framework;
   testRunnerKind: TestRunnerKind;
+  /** True when the platform supports running Vitest on this stack. */
+  supported: boolean;
   hint: string;            // human-readable explanation
   packageManager: "pnpm" | "npm" | "yarn";
   hasTypescript: boolean;
@@ -51,102 +65,108 @@ export async function detectFramework(
     const framework: Framework = fileSet.has("app/page.tsx") || fileSet.has("src/app/page.tsx") || fileSet.has("app/layout.tsx")
       ? "next-app"
       : "next-pages";
-    return {
+    return result({
       framework,
-      testRunnerKind: "vitest",
-      hint: "Next.js project — Vitest is the right runner for component logic. Use Playwright separately for full-page flows.",
+      hint: "Next.js project — Vitest covers component and hook logic.",
       packageManager,
       hasTypescript,
-    };
+    });
   }
 
   if (has("@remix-run/react") || has("@remix-run/node")) {
-    return {
+    return result({
       framework: "remix",
-      testRunnerKind: "vitest",
       hint: "Remix project — Vitest covers route/component logic.",
       packageManager,
       hasTypescript,
-    };
+    });
   }
 
   if (has("react") && (has("vite") || fileSet.has("vite.config.ts") || fileSet.has("vite.config.js"))) {
-    return {
+    return result({
       framework: "vite-react",
-      testRunnerKind: "vitest",
-      hint: "Vite + React project — Vitest runs in Node and tests components directly. No Target Domain needed.",
+      hint: "Vite + React project — Vitest runs your components in happy-dom.",
       packageManager,
       hasTypescript,
-    };
+    });
   }
 
   if (has("react-scripts")) {
-    return {
+    return result({
       framework: "cra",
-      testRunnerKind: "vitest",
-      hint: "Create-React-App project — Vitest can replace the bundled Jest setup.",
+      hint: "Create-React-App project — Vitest replaces the bundled Jest setup.",
       packageManager,
       hasTypescript,
-    };
+    });
   }
 
   if (has("react")) {
-    return {
-      framework: "vite-react",   // fallback: assume vite-style for plain React deps
-      testRunnerKind: "vitest",
-      hint: "React library/project — Vitest covers component tests.",
+    return result({
+      framework: "vite-react",   // fallback: treat plain React deps as Vite-React
+      hint: "React project — Vitest covers component tests.",
       packageManager,
       hasTypescript,
-    };
+    });
   }
 
   if (has("vue")) {
-    return {
+    return result({
       framework: "vue",
-      testRunnerKind: "vitest",
-      hint: "Vue project — Vitest with @vue/test-utils.",
+      hint: "Vue project — this platform currently supports React projects only.",
       packageManager,
       hasTypescript,
-    };
+    });
   }
 
   if (has("svelte") || has("@sveltejs/kit")) {
-    return {
+    return result({
       framework: "svelte",
-      testRunnerKind: "vitest",
-      hint: "Svelte project — Vitest is the default runner.",
+      hint: "Svelte project — this platform currently supports React projects only.",
       packageManager,
       hasTypescript,
-    };
+    });
   }
 
-  // No frontend framework detected. Is there an index.html or other web entry?
   if (fileSet.has("index.html") || fileSet.has("public/index.html")) {
-    return {
+    return result({
       framework: "static",
-      testRunnerKind: "playwright",
-      hint: "Static / multi-page site — Playwright will exercise it against the Target Domain.",
+      hint: "Static site — no React detected. This platform currently supports React projects only.",
       packageManager,
       hasTypescript,
-    };
+    });
   }
 
   if (pkg && (pkg as { main?: unknown }).main) {
-    return {
+    return result({
       framework: "node-library",
-      testRunnerKind: "vitest",
-      hint: "Node library — Vitest runs the unit tests.",
+      hint: "Node library — no React detected. This platform currently supports React projects only.",
       packageManager,
       hasTypescript,
-    };
+    });
   }
 
-  return {
+  return result({
     framework: "unknown",
-    testRunnerKind: "playwright",
-    hint: "Couldn't infer the framework from package.json. Falling back to Playwright against the Target Domain.",
+    hint: "Couldn't detect a framework from package.json. This platform currently supports React projects only.",
     packageManager,
     hasTypescript,
+  });
+}
+
+function result(input: {
+  framework: Framework;
+  hint: string;
+  packageManager: DetectionResult["packageManager"];
+  hasTypescript: boolean;
+}): DetectionResult {
+  const supported = isSupportedFramework(input.framework);
+  return {
+    framework: input.framework,
+    testRunnerKind: "vitest",
+    supported,
+    hint: input.hint,
+    packageManager: input.packageManager,
+    hasTypescript: input.hasTypescript,
   };
 }
 

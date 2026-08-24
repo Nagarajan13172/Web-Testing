@@ -4,7 +4,7 @@ import { generateTests } from "@webtesting/ai";
 import { requireUser } from "@/lib/auth";
 import { installationOctokit } from "@/lib/github";
 import { snapshotRepo } from "@/lib/github-pr";
-import { detectFramework } from "@/lib/framework-detect";
+import { detectFramework, isSupportedFramework } from "@/lib/framework-detect";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -39,19 +39,20 @@ export async function POST(
 
   const octokit = installationOctokit(repo.installationId);
 
-  // Auto-detect framework if not already set, so we pick the right runner.
+  // Detect framework if not already cached. The platform only supports React
+  // projects right now — reject anything else with a clear message.
   let framework = repo.framework;
-  let runnerKind = (repo.testRunnerKind as "vitest" | "playwright" | null) ?? null;
-  if (!framework || !runnerKind) {
+  let hint: string | null = null;
+  if (!framework || !repo.testRunnerKind) {
     try {
       const detected = await detectFramework(octokit, repo.owner, repo.name);
       framework = detected.framework;
-      runnerKind = detected.testRunnerKind;
+      hint = detected.hint;
       await db
         .update(repos)
         .set({
           framework,
-          testRunnerKind: runnerKind,
+          testRunnerKind: detected.supported ? "vitest" : null,
           frameworkDetectedAt: new Date(),
         })
         .where(eq(repos.id, repo.id));
@@ -61,6 +62,17 @@ export async function POST(
         { status: 502 },
       );
     }
+  }
+
+  if (!framework || !isSupportedFramework(framework as never)) {
+    return NextResponse.json(
+      {
+        error: "Only React projects are supported right now.",
+        framework,
+        hint: hint ?? "Detected a non-React project.",
+      },
+      { status: 400 },
+    );
   }
 
   let snapshot;
@@ -77,7 +89,7 @@ export async function POST(
   try {
     generated = await generateTests({
       repoFullName: `${repo.owner}/${repo.name}`,
-      runnerKind: runnerKind ?? "playwright",
+      runnerKind: "vitest",
       framework,
       fileTree: snapshot.fileTree,
       files: snapshot.files,
@@ -106,14 +118,6 @@ export async function POST(
         status: "pending" as const,
       })),
     );
-
-    // If the repo has no target_domain yet, seed it from the AI's suggested baseURL.
-    if (!repo.targetDomain && generated.baseURL) {
-      await tx
-        .update(repos)
-        .set({ targetDomain: generated.baseURL })
-        .where(eq(repos.id, repo.id));
-    }
   });
 
   return NextResponse.json({

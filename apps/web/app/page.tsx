@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { ArrowRight, Github, Sparkles, ShieldCheck, Activity } from "lucide-react";
+import { ArrowRight, Github, Sparkles, Atom, FlaskConical } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
 export default function LandingPage() {
@@ -27,19 +27,20 @@ export default function LandingPage() {
       <main className="relative z-10">
         <section className="container flex flex-col items-center pt-24 pb-20 text-center md:pt-32 md:pb-28">
           <div className="mb-6 inline-flex items-center gap-2 rounded-full border border-border/80 bg-card/40 px-3 py-1 text-xs text-muted-foreground backdrop-blur">
-            <Sparkles className="h-3 w-3 text-primary" strokeWidth={1.75} />
-            <span>AI-generated tests, on every push</span>
+            <Atom className="h-3 w-3 text-primary" strokeWidth={1.75} />
+            <span>React component tests, written for you</span>
           </div>
 
           <h1 className="max-w-3xl text-balance text-4xl font-semibold tracking-tight md:text-6xl">
-            CI that writes the tests
+            AI-generated unit tests
             <br />
-            <span className="text-muted-foreground">you don&apos;t have.</span>
+            <span className="text-muted-foreground">for your React components.</span>
           </h1>
 
           <p className="mt-6 max-w-xl text-balance text-base text-muted-foreground md:text-lg">
-            Connect a GitHub repo. We lint, type-check, build, and run your tests in
-            isolated sandboxes — then generate the ones you&apos;re missing.
+            Connect a GitHub repo. We read your components, generate Vitest +
+            React Testing Library tests, run them in a sandbox, and report
+            coverage.
           </p>
 
           <div className="mt-10 flex flex-col items-center gap-3 sm:flex-row">
@@ -63,19 +64,19 @@ export default function LandingPage() {
         <section id="how" className="container pb-32">
           <div className="mx-auto grid max-w-5xl gap-4 md:grid-cols-3">
             <FeatureCard
-              icon={<Activity strokeWidth={1.5} />}
-              title="Multi-language CI"
-              body="JS/TS, Python, Java, Go. Vitest, pytest, JUnit, go test — auto-detected per repo."
+              icon={<Atom strokeWidth={1.5} />}
+              title="React-first"
+              body="Vite, Next.js, Remix, CRA. We detect your stack and target the components that matter."
             />
             <FeatureCard
               icon={<Sparkles strokeWidth={1.5} />}
               title="AI test generation"
-              body="No tests yet? We read your code and open a PR with the suite it needs."
+              body="No tests yet? We read your components and produce Vitest specs with idiomatic queries."
             />
             <FeatureCard
-              icon={<ShieldCheck strokeWidth={1.5} />}
-              title="Sandboxed runs"
-              body="Every run executes in an isolated Docker container with a per-repo secrets vault."
+              icon={<FlaskConical strokeWidth={1.5} />}
+              title="Coverage included"
+              body="Every run produces line coverage so you can see exactly which components still lack tests."
             />
           </div>
         </section>

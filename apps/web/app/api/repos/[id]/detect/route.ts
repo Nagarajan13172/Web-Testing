@@ -42,13 +42,24 @@ export async function POST(
     );
   }
 
-  // If the runner kind is changing, existing test cases are written for the
-  // wrong framework (Vitest can't run Playwright code and vice-versa).
-  // Wipe them so the UI's empty-state forces a fresh Generate.
-  const runnerChanged =
-    repo.testRunnerKind != null && repo.testRunnerKind !== detection.testRunnerKind;
+  // Only persist runner kind for supported (React) frameworks. For everything
+  // else, store the framework value so the UI can show what was detected, but
+  // leave testRunnerKind null — generate/run-tests use that as a gate.
+  const update: Partial<typeof repos.$inferInsert> = {
+    framework: detection.framework,
+    frameworkDetectedAt: new Date(),
+  };
+  if (detection.supported) {
+    update.testRunnerKind = detection.testRunnerKind;
+  } else {
+    update.testRunnerKind = null;
+  }
+
+  // Wipe stale cases if we've moved from supported → unsupported (they no
+  // longer make sense) or vice-versa.
+  const wasSupported = repo.testRunnerKind != null;
   let clearedCount = 0;
-  if (runnerChanged) {
+  if (wasSupported !== detection.supported) {
     const deleted = await db
       .delete(testCases)
       .where(eq(testCases.repoId, repo.id))
@@ -58,21 +69,17 @@ export async function POST(
 
   await db
     .update(repos)
-    .set({
-      framework: detection.framework,
-      testRunnerKind: detection.testRunnerKind,
-      frameworkDetectedAt: new Date(),
-    })
+    .set(update)
     .where(eq(repos.id, repo.id));
 
   return NextResponse.json({
     framework: detection.framework,
-    testRunnerKind: detection.testRunnerKind,
+    supported: detection.supported,
+    testRunnerKind: detection.supported ? detection.testRunnerKind : null,
     hint: detection.hint,
     packageManager: detection.packageManager,
     hasTypescript: detection.hasTypescript,
     clearedCases: clearedCount,
-    runnerChanged,
   });
 }
 
