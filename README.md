@@ -24,6 +24,9 @@ and line coverage.
 - **AI test generation** — 6–10 Vitest + RTL cases per repo, stored as editable test cases.
 - **Sandboxed runs** — clone → inject specs under `tests/ai/` → run in Docker → parse
   JUnit back to per-case pass/fail with failure messages and stack traces.
+- **Self-repair** — a spec that fails goes back to the model with its actual error
+  and the source of the components it imports, and the suite is re-run. Generation
+  can only predict what a component renders; this pass sees what really happened.
 - **Coverage** — v8 line coverage per file, shown on the run detail page.
 - **AI failure explanation** — streamed onto failing tests on the run detail page.
 - **Legacy push pipeline** — `apps/worker/src/orchestrator.ts` still runs the original
@@ -127,6 +130,18 @@ elements). `packages/ai/src/sanitize.ts` is the single source of truth for those
 rewrites — it runs at generation time *and* again in the worker, so cases stored
 before a rewrite existed heal on their next run. Every rewrite must stay
 idempotent; `pnpm test` enforces that.
+
+**Repair rounds.** `TEST_REPAIR_ROUNDS` (default `1`) caps how many times a failing
+spec is sent back to be fixed. Each round costs one model call per failed spec plus
+one re-run of the suite; set it to `0` to disable repair. Re-runs are cheap because
+`node_modules` lives in the mounted workdir, so the second install is a no-op.
+
+**Model output budget.** `maxOutputTokens` on the 2.5 models covers thinking *and*
+the response. Thinking regularly runs to five figures on these tasks, so a budget
+sized for the JSON alone gets spent before the model emits anything — and the reply
+comes back as truncated, unparseable JSON with `finishReason: STOP`, which reads
+like a malformed response rather than an exhausted budget. Both calls use the shared
+`MAX_OUTPUT_TOKENS` in `packages/ai/src/retry.ts`; don't lower it.
 
 **Vitest config.** The runner always writes its own `vitest.webtesting.config.ts`
 into the clone and passes `--config` explicitly, so a config shipped by the target

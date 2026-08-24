@@ -1,5 +1,6 @@
 import { GoogleGenerativeAI, SchemaType, type Schema } from "@google/generative-ai";
 import { sanitizeTestCode } from "./sanitize";
+import { withRetry, MAX_OUTPUT_TOKENS } from "./retry";
 
 export interface RepoContextFile {
   path: string;
@@ -166,7 +167,7 @@ export async function generateTests(input: GenerateTestsInput): Promise<Generate
     model: TEST_GEN_MODEL,
     systemInstruction: systemPrompt,
     generationConfig: {
-      maxOutputTokens: 8192,
+      maxOutputTokens: MAX_OUTPUT_TOKENS,
       temperature: 0.3,
       responseMimeType: "application/json",
       responseSchema: RESPONSE_SCHEMA,
@@ -246,41 +247,6 @@ function truncate(s: string, max: number): string {
   return s.slice(0, max) + `\n\n... (truncated, ${s.length - max} more chars)`;
 }
 
-async function withRetry<T>(
-  fn: () => Promise<T>,
-  opts: { attempts?: number; baseDelayMs?: number } = {},
-): Promise<T> {
-  const attempts = opts.attempts ?? 4;
-  const base = opts.baseDelayMs ?? 1500;
-  let lastErr: unknown;
-  for (let i = 0; i < attempts; i++) {
-    try {
-      return await fn();
-    } catch (err) {
-      lastErr = err;
-      if (i === attempts - 1 || !isRetryable(err)) break;
-      const delay = base * Math.pow(2, i) + Math.random() * 400;
-      await new Promise((r) => setTimeout(r, delay));
-    }
-  }
-  throw lastErr;
-}
-
-function isRetryable(err: unknown): boolean {
-  if (!err) return false;
-  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
-  return (
-    msg.includes("503") ||
-    msg.includes("429") ||
-    msg.includes("service unavailable") ||
-    msg.includes("overloaded") ||
-    msg.includes("high demand") ||
-    msg.includes("rate limit") ||
-    msg.includes("etimedout") ||
-    msg.includes("econnreset") ||
-    msg.includes("fetch failed")
-  );
-}
 
 function isGenerateTestsResult(v: unknown): v is Omit<GenerateTestsResult, "usage"> {
   if (!v || typeof v !== "object") return false;

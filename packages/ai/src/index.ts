@@ -6,6 +6,14 @@ export {
 } from "./explainFailure";
 
 export {
+  repairTest,
+  localImportPaths,
+  TEST_REPAIR_MODEL,
+  type RepairTestInput,
+  type RepairTestResult,
+} from "./repairTest";
+
+export {
   sanitizeTestCode,
   sanitizeNestedRouter,
   sanitizeGetByText,

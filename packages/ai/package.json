@@ -7,7 +7,8 @@
   "types": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts",
-    "./sanitize": "./src/sanitize.ts"
+    "./sanitize": "./src/sanitize.ts",
+    "./repairTest": "./src/repairTest.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

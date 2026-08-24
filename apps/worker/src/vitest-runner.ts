@@ -16,6 +16,7 @@ import {
 } from "@webtesting/db";
 import { parseJunit } from "@webtesting/junit-parser";
 import { sanitizeTestCode } from "@webtesting/ai/sanitize";
+import { repairTest, localImportPaths } from "@webtesting/ai/repairTest";
 import { installationAccessToken, tokenizedCloneUrl } from "./github";
 import type { Logger } from "./orchestrator";
 
@@ -27,6 +28,13 @@ const VITEST_CONFIG_FILENAME = "vitest.webtesting.config.ts";
 
 /** Printed inside the container when a dependency install fails. */
 const INSTALL_FAILED_MARKER = "WEBTESTING_INSTALL_FAILED:";
+
+/**
+ * How many times a failing spec may be sent back to the model to be fixed
+ * against its own error. Each round costs one model call per failed spec plus
+ * one re-run of the suite. 0 disables repair entirely.
+ */
+const REPAIR_ROUNDS = Math.max(0, Number(process.env.TEST_REPAIR_ROUNDS ?? 1));
 
 export interface RunVitestInput {
   repoId: string;
@@ -136,71 +144,55 @@ export async function runVitestCases(input: RunVitestInput, log: Logger): Promis
     // Ensure jest-dom setup file exists so generated tests can rely on matchers.
     await ensureSetupFile(repoDir);
 
-    // ---- Run docker: install deps + vitest -------------------------------
-    const installCmd = installCommand(repoDir);
-    const extraDeps =
-      "vitest@^2 @vitest/coverage-v8@^2 happy-dom@^15 @testing-library/react@^16 @testing-library/jest-dom@^6 @testing-library/user-event@^14 @vitejs/plugin-react@^4 vite-tsconfig-paths@^5";
+    // ---- Run, repair, re-run ---------------------------------------------
+    const suite = await runSuite({ workdir, repoDir, runId, attempt: 1, log });
 
-    const script = [
-      `cd /work/repo`,
-      installStep(installCmd, "repo dependencies"),
-      installStep(`npm install --no-audit --no-fund -D ${extraDeps}`, "test dependencies"),
-      // Diagnostic: list what we're about to run, so future failures are easier to debug.
-      `echo "=== files in tests/ai ===" && ls -la /work/repo/tests/ai/ || true`,
-      // Drop --dir (it double-scopes the include glob) and let the config drive discovery.
-      // --config is explicit so a vitest/vite config shipped by the target repo
-      // can't take precedence over ours.
-      `npx vitest run --root /work/repo --config /work/repo/${VITEST_CONFIG_FILENAME} --reporter=junit --outputFile=/work/results.xml --coverage`,
-    ].join(" && ");
-
-    const dockerArgs = [
-      "run", "--rm",
-      "-v", `${workdir}:/work`,
-      "-w", "/work/repo",
-      "--memory=3g", "--cpus=2",
-      "-e", "CI=true",
-      VITEST_IMAGE,
-      "sh", "-lc", script,
-    ];
-
-    log("docker run", { image: VITEST_IMAGE });
-    const testStart = Date.now();
-    const result = await execHost("docker", dockerArgs, { timeoutMs: JOB_TIMEOUT_MS, log });
-    log("docker exit", { exitCode: result.exitCode });
-    // A non-zero exit here usually just means some tests failed, which is a
-    // legitimate outcome — the step status reflects that honestly.
-    await recordStep(runId, "test", "unit", testStart, result.exitCode);
-
-    const combinedOutput = combineOutput(result);
-
-    // ---- Parse JUnit -----------------------------------------------------
-    const junitPath = join(workdir, "results.xml");
-    let xml: string | null = null;
-    if (existsSync(junitPath)) {
-      xml = await readFile(junitPath, "utf8");
-    } else {
-      const m = result.stdout.match(/<testsuites[\s\S]*?<\/testsuites>/);
-      if (m) xml = m[0];
-    }
-
-    if (!xml) {
+    if (!suite.parsed) {
       // Distinguish "deps never installed" from "Vitest ran but wrote nothing",
       // which are very different things to debug.
-      const installFailed = combinedOutput.includes(INSTALL_FAILED_MARKER);
+      const installFailed = suite.combinedOutput.includes(INSTALL_FAILED_MARKER);
       if (installFailed) log("dependency install failed", {});
       await markAllFailed(
         testCaseIds,
         installFailed
           ? "dependency install failed inside the sandbox — see run output"
           : "Vitest did not produce JUnit results",
-        combinedOutput,
+        suite.combinedOutput,
       );
       finalStatus = "failure";
       return;
     }
 
-    const parsed = parseJunit(xml);
-    log("junit parsed", parsed.totals);
+    let parsed = suite.parsed;
+    let combinedOutput = suite.combinedOutput;
+
+    // Generation can only predict what a component renders; this pass gets the
+    // actual failure and fixes against it. Bounded, and each round re-runs the
+    // whole suite so the results and coverage we store stay consistent.
+    for (let round = 1; round <= REPAIR_ROUNDS; round++) {
+      const failedNow = [...aggregatePerCase(parsed.tests).entries()].filter(
+        ([, r]) => r.status === "failed",
+      );
+      if (failedNow.length === 0) break;
+
+      const repaired = await repairFailedCases({
+        runId,
+        repoDir,
+        cases,
+        failed: failedNow,
+        round,
+        log,
+      });
+      if (repaired === 0) break;
+
+      const next = await runSuite({ workdir, repoDir, runId, attempt: round + 1, log });
+      if (!next.parsed) {
+        log("re-run after repair produced no results; keeping previous results", {});
+        break;
+      }
+      parsed = next.parsed;
+      combinedOutput = next.combinedOutput;
+    }
 
     const perCase = aggregatePerCase(parsed.tests);
     const seen = new Set(perCase.keys());
@@ -319,6 +311,186 @@ async function readCoverageRows(
     });
   }
   return rows;
+}
+
+interface RunSuiteArgs {
+  workdir: string;
+  repoDir: string;
+  runId: string;
+  /** 1 for the first pass, 2+ for a re-run after repair. */
+  attempt: number;
+  log: Logger;
+}
+
+interface SuiteOutcome {
+  /** null when Vitest produced no JUnit at all. */
+  parsed: ReturnType<typeof parseJunit> | null;
+  combinedOutput: string;
+}
+
+/**
+ * One full pass: install, run every spec under tests/ai, collect JUnit and
+ * coverage. Re-runs are cheap — node_modules lives in the mounted workdir, so
+ * the install on attempt 2 is a no-op.
+ */
+async function runSuite(args: RunSuiteArgs): Promise<SuiteOutcome> {
+  const { workdir, repoDir, runId, attempt, log } = args;
+  const installCmd = installCommand(repoDir);
+  const extraDeps =
+    "vitest@^2 @vitest/coverage-v8@^2 happy-dom@^15 @testing-library/react@^16 @testing-library/jest-dom@^6 @testing-library/user-event@^14 @vitejs/plugin-react@^4 vite-tsconfig-paths@^5";
+
+  const script = [
+    `cd /work/repo`,
+    installStep(installCmd, "repo dependencies"),
+    installStep(`npm install --no-audit --no-fund -D ${extraDeps}`, "test dependencies"),
+    // Diagnostic: list what we're about to run, so future failures are easier to debug.
+    `echo "=== files in tests/ai ===" && ls -la /work/repo/tests/ai/ || true`,
+    // Drop --dir (it double-scopes the include glob) and let the config drive discovery.
+    // --config is explicit so a vitest/vite config shipped by the target repo
+    // can't take precedence over ours.
+    `npx vitest run --root /work/repo --config /work/repo/${VITEST_CONFIG_FILENAME} --reporter=junit --outputFile=/work/results.xml --coverage`,
+  ].join(" && ");
+
+  const dockerArgs = [
+    "run", "--rm",
+    "-v", `${workdir}:/work`,
+    "-w", "/work/repo",
+    "--memory=3g", "--cpus=2",
+    "-e", "CI=true",
+    VITEST_IMAGE,
+    "sh", "-lc", script,
+  ];
+
+  log("docker run", { image: VITEST_IMAGE, attempt });
+  const started = Date.now();
+  const result = await execHost("docker", dockerArgs, { timeoutMs: JOB_TIMEOUT_MS, log });
+  log("docker exit", { exitCode: result.exitCode, attempt });
+  // A non-zero exit here usually just means some tests failed, which is a
+  // legitimate outcome — the step status reflects that honestly.
+  await recordStep(
+    runId,
+    attempt === 1 ? "test" : `test (after repair ${attempt - 1})`,
+    "unit",
+    started,
+    result.exitCode,
+  );
+
+  const combinedOutput = combineOutput(result);
+
+  const junitPath = join(workdir, "results.xml");
+  let xml: string | null = null;
+  if (existsSync(junitPath)) {
+    xml = await readFile(junitPath, "utf8");
+  } else {
+    const m = result.stdout.match(/<testsuites[\s\S]*?<\/testsuites>/);
+    if (m) xml = m[0];
+  }
+  if (!xml) return { parsed: null, combinedOutput };
+
+  const parsed = parseJunit(xml);
+  log("junit parsed", { ...parsed.totals, attempt });
+  return { parsed, combinedOutput };
+}
+
+interface RepairArgs {
+  runId: string;
+  repoDir: string;
+  cases: Array<typeof testCases.$inferSelect>;
+  failed: Array<[string, PerCaseResult]>;
+  round: number;
+  log: Logger;
+}
+
+/**
+ * Sends each failed spec back to the model along with the error it produced and
+ * the source of the components it imports, then writes the corrected spec into
+ * the checkout and persists it.
+ *
+ * Repairs are stored even if they go on to fail again: the stored case should
+ * always be the code that actually ran, and the next run gets to repair against
+ * a fresh, more specific error.
+ *
+ * Returns how many specs were actually rewritten.
+ */
+async function repairFailedCases(args: RepairArgs): Promise<number> {
+  const { runId, repoDir, cases, failed, round, log } = args;
+  const byId = new Map(cases.map((c) => [c.id, c]));
+  const started = Date.now();
+  let repaired = 0;
+
+  log("repairing failed specs", { round, count: failed.length });
+
+  for (const [caseId, res] of failed) {
+    const c = byId.get(caseId);
+    if (!c) continue;
+    const short = caseId.slice(0, 8);
+    try {
+      const current = await readFile(
+        join(repoDir, "tests", "ai", `${caseId}.test.tsx`),
+        "utf8",
+      );
+      const sources = await readImportedSources(repoDir, current);
+      const out = await repairTest({
+        code: current,
+        testTitle: c.title,
+        failureMessage: res.failureMessage,
+        failureStack: res.failureStack,
+        sources,
+      });
+
+      if (out.code.trim() === current.trim()) {
+        log("repair returned the same spec", { case: short });
+        continue;
+      }
+
+      await writeFile(join(repoDir, "tests", "ai", `${caseId}.test.tsx`), out.code, "utf8");
+      await db
+        .update(testCases)
+        .set({ playwrightCode: out.code })
+        .where(eq(testCases.id, caseId));
+      repaired++;
+      log("repaired", {
+        case: short,
+        sources: sources.length,
+        diagnosis: out.diagnosis.slice(0, 140),
+      });
+    } catch (err) {
+      // One spec failing to repair must not sink the round.
+      log("repair failed", { case: short, err: String(err).slice(0, 200) });
+    }
+  }
+
+  await recordStep(runId, `repair ${round}`, null, started, 0);
+  log("repair round done", { round, repaired });
+  return repaired;
+}
+
+const SOURCE_EXTENSIONS = ["", ".tsx", ".ts", ".jsx", ".js"];
+
+/**
+ * Reads the local modules a spec imports, so the repair pass can see what the
+ * component actually renders rather than guessing again.
+ */
+async function readImportedSources(
+  repoDir: string,
+  code: string,
+): Promise<Array<{ path: string; content: string }>> {
+  const out: Array<{ path: string; content: string }> = [];
+  for (const rel of localImportPaths(code)) {
+    // The spec is model-written; never let a specifier walk out of the checkout.
+    if (rel.includes("..") || rel.startsWith("/")) continue;
+    for (const ext of SOURCE_EXTENSIONS) {
+      const full = join(repoDir, rel + ext);
+      if (!existsSync(full)) continue;
+      try {
+        out.push({ path: rel + ext, content: await readFile(full, "utf8") });
+      } catch {
+        /* unreadable — skip */
+      }
+      break;
+    }
+  }
+  return out;
 }
 
 /**
