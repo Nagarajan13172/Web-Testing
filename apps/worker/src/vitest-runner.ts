@@ -7,15 +7,26 @@ import {
   db,
   testCases,
   repos,
+  runs,
+  runSteps,
+  testResults,
+  coverage,
   eq,
   inArray,
 } from "@webtesting/db";
 import { parseJunit } from "@webtesting/junit-parser";
+import { sanitizeTestCode } from "@webtesting/ai/sanitize";
 import { installationAccessToken, tokenizedCloneUrl } from "./github";
 import type { Logger } from "./orchestrator";
 
 const VITEST_IMAGE = process.env.VITEST_IMAGE ?? "webtesting/node:latest";
 const JOB_TIMEOUT_MS = Number(process.env.VITEST_TIMEOUT_MS ?? 15 * 60_000);
+
+/** Deliberately not `vitest.config.ts` — see writeVitestConfig. */
+const VITEST_CONFIG_FILENAME = "vitest.webtesting.config.ts";
+
+/** Printed inside the container when a dependency install fails. */
+const INSTALL_FAILED_MARKER = "WEBTESTING_INSTALL_FAILED:";
 
 export interface RunVitestInput {
   repoId: string;
@@ -38,6 +49,23 @@ export async function runVitestCases(input: RunVitestInput, log: Logger): Promis
     return;
   }
 
+  // Create a run row so coverage data (which references runs.id) has a home.
+  const [runRow] = await db
+    .insert(runs)
+    .values({
+      repoId,
+      commitSha: "HEAD",
+      branch: repo.defaultBranch,
+      status: "running",
+      triggeredBy: "test-cases",
+      startedAt: new Date(),
+    })
+    .returning({ id: runs.id });
+  const runId = runRow!.id;
+  log("run created", { runId });
+
+  let finalStatus: "success" | "failure" = "success";
+
   const workdir = await mkdtemp(join(tmpdir(), "webtesting-vt-"));
   const repoDir = join(workdir, "repo");
 
@@ -54,45 +82,75 @@ export async function runVitestCases(input: RunVitestInput, log: Logger): Promis
       }
     }
     log("cloning", { repo: `${repo.owner}/${repo.name}` });
+    const cloneStart = Date.now();
     const cloneResult = await execHost(
       "git",
       ["clone", "--depth=1", cloneUrl, repoDir],
       { timeoutMs: 90_000, log },
     );
+    await recordStep(runId, "clone", null, cloneStart, cloneResult.exitCode);
     if (cloneResult.exitCode !== 0) {
       await markAllFailed(testCaseIds, "git clone failed", combineOutput(cloneResult));
+      finalStatus = "failure";
       return;
+    }
+
+    // Record the commit we actually tested — the run row is seeded with a
+    // placeholder "HEAD" because the SHA isn't known until the clone lands.
+    const shaResult = await execHost("git", ["-C", repoDir, "rev-parse", "HEAD"], {
+      timeoutMs: 30_000,
+      log,
+    });
+    const commitSha = shaResult.stdout.trim();
+    if (shaResult.exitCode === 0 && commitSha) {
+      await db.update(runs).set({ commitSha }).where(eq(runs.id, runId));
     }
 
     // ---- Write generated specs ------------------------------------------
     const aiTestsDir = join(repoDir, "tests", "ai");
     await mkdir(aiTestsDir, { recursive: true });
+    let healed = 0;
     for (const c of cases) {
       const fname = `${c.id}.test.tsx`;
       // Defensively rewrite known AI antipatterns at runtime so older stored
       // cases (generated before the sanitizer was added) self-heal.
       const sanitized = sanitizeTestCode(c.playwrightCode);
       await writeFile(join(aiTestsDir, fname), sanitized, "utf8");
-    }
 
-    // Make sure there's a vitest config that points at tests/ai with a DOM env.
-    await ensureVitestConfig(repoDir);
+      // Persist the rewrite. Without this the stored case keeps the broken
+      // original — so the editor shows code that would fail if anyone ran or
+      // exported it, even though the run itself passed.
+      if (sanitized !== c.playwrightCode) {
+        await db
+          .update(testCases)
+          .set({ playwrightCode: sanitized })
+          .where(eq(testCases.id, c.id));
+        healed++;
+      }
+    }
+    if (healed > 0) log("stored code repaired", { cases: healed });
+
+    // Write the config that points at tests/ai with a DOM env. Always written,
+    // and passed to Vitest via --config below.
+    await writeVitestConfig(repoDir);
     // Ensure jest-dom setup file exists so generated tests can rely on matchers.
     await ensureSetupFile(repoDir);
 
     // ---- Run docker: install deps + vitest -------------------------------
     const installCmd = installCommand(repoDir);
     const extraDeps =
-      "vitest@^2 happy-dom@^15 @testing-library/react@^16 @testing-library/jest-dom@^6 @testing-library/user-event@^14 @vitejs/plugin-react@^4 vite-tsconfig-paths@^5";
+      "vitest@^2 @vitest/coverage-v8@^2 happy-dom@^15 @testing-library/react@^16 @testing-library/jest-dom@^6 @testing-library/user-event@^14 @vitejs/plugin-react@^4 vite-tsconfig-paths@^5";
 
     const script = [
       `cd /work/repo`,
-      `${installCmd} 2>&1 | tail -50 || true`,
-      `npm install --silent --no-audit --no-fund -D ${extraDeps} || true`,
+      installStep(installCmd, "repo dependencies"),
+      installStep(`npm install --no-audit --no-fund -D ${extraDeps}`, "test dependencies"),
       // Diagnostic: list what we're about to run, so future failures are easier to debug.
       `echo "=== files in tests/ai ===" && ls -la /work/repo/tests/ai/ || true`,
       // Drop --dir (it double-scopes the include glob) and let the config drive discovery.
-      `npx vitest run --root /work/repo --reporter=junit --outputFile=/work/results.xml`,
+      // --config is explicit so a vitest/vite config shipped by the target repo
+      // can't take precedence over ours.
+      `npx vitest run --root /work/repo --config /work/repo/${VITEST_CONFIG_FILENAME} --reporter=junit --outputFile=/work/results.xml --coverage`,
     ].join(" && ");
 
     const dockerArgs = [
@@ -106,8 +164,12 @@ export async function runVitestCases(input: RunVitestInput, log: Logger): Promis
     ];
 
     log("docker run", { image: VITEST_IMAGE });
+    const testStart = Date.now();
     const result = await execHost("docker", dockerArgs, { timeoutMs: JOB_TIMEOUT_MS, log });
     log("docker exit", { exitCode: result.exitCode });
+    // A non-zero exit here usually just means some tests failed, which is a
+    // legitimate outcome — the step status reflects that honestly.
+    await recordStep(runId, "test", "unit", testStart, result.exitCode);
 
     const combinedOutput = combineOutput(result);
 
@@ -122,7 +184,18 @@ export async function runVitestCases(input: RunVitestInput, log: Logger): Promis
     }
 
     if (!xml) {
-      await markAllFailed(testCaseIds, "Vitest did not produce JUnit results", combinedOutput);
+      // Distinguish "deps never installed" from "Vitest ran but wrote nothing",
+      // which are very different things to debug.
+      const installFailed = combinedOutput.includes(INSTALL_FAILED_MARKER);
+      if (installFailed) log("dependency install failed", {});
+      await markAllFailed(
+        testCaseIds,
+        installFailed
+          ? "dependency install failed inside the sandbox — see run output"
+          : "Vitest did not produce JUnit results",
+        combinedOutput,
+      );
+      finalStatus = "failure";
       return;
     }
 
@@ -131,6 +204,33 @@ export async function runVitestCases(input: RunVitestInput, log: Logger): Promis
 
     const perCase = aggregatePerCase(parsed.tests);
     const seen = new Set(perCase.keys());
+
+    // ---- Per-test rows ---------------------------------------------------
+    // The run detail page reads test_results / run_steps. Without these a
+    // run created by this path renders as an empty shell, and the "explain
+    // this failure" button has nothing to attach to.
+    const caseById = new Map(cases.map((c) => [c.id, c]));
+    const resultRows = parsed.tests.map((t) => {
+      const caseId = caseIdFromFile(t.file);
+      const c = caseId ? caseById.get(caseId) : undefined;
+      return {
+        runId,
+        kind: testKindFor(c?.category),
+        file: t.file || "unknown",
+        // The on-disk filename is a UUID, so surface the case title instead —
+        // it's what the dashboard shows and the only human-readable handle.
+        suite: c?.title ?? t.suite,
+        name: t.name,
+        status: t.status,
+        durationMs: t.durationMs,
+        failureMessage: t.failureMessage,
+        failureStack: t.failureStack,
+      };
+    });
+    if (resultRows.length > 0) {
+      await db.insert(testResults).values(resultRows);
+      log("test results stored", { count: resultRows.length });
+    }
 
     await db.transaction(async (tx) => {
       for (const [caseId, r] of perCase.entries()) {
@@ -160,9 +260,103 @@ export async function runVitestCases(input: RunVitestInput, log: Logger): Promis
           .where(inArray(testCases.id, missing));
       }
     });
+
+    if (parsed.totals.failed > 0) finalStatus = "failure";
+
+    // ---- Coverage --------------------------------------------------------
+    try {
+      const rows = await readCoverageRows(workdir, runId);
+      if (rows.length > 0) {
+        await db.insert(coverage).values(rows);
+        log("coverage stored", { files: rows.length });
+      } else {
+        log("no coverage data found");
+      }
+    } catch (err) {
+      log("coverage parse failed", { err: String(err) });
+    }
   } finally {
     rm(workdir, { recursive: true, force: true }).catch(() => undefined);
+    await db
+      .update(runs)
+      .set({ status: finalStatus, finishedAt: new Date() })
+      .where(eq(runs.id, runId))
+      .catch(() => undefined);
   }
+}
+
+interface CoverageSummary {
+  [file: string]: {
+    lines?: { total?: number; covered?: number; pct?: number };
+  };
+}
+
+/**
+ * Reads v8 coverage-summary.json from the workdir and converts it to rows
+ * suitable for the `coverage` table. Skips the synthetic "total" entry — that
+ * one is recomputable from the per-file rows at read time.
+ */
+async function readCoverageRows(
+  workdir: string,
+  runId: string,
+): Promise<Array<{ runId: string; file: string; linesTotal: number; linesCovered: number; pct: number }>> {
+  const summaryPath = join(workdir, "coverage", "coverage-summary.json");
+  if (!existsSync(summaryPath)) return [];
+  const text = await readFile(summaryPath, "utf8");
+  const summary = JSON.parse(text) as CoverageSummary;
+  const rows: Array<{ runId: string; file: string; linesTotal: number; linesCovered: number; pct: number }> = [];
+  for (const [file, data] of Object.entries(summary)) {
+    if (file === "total") continue;
+    const lines = data.lines;
+    if (!lines) continue;
+    rows.push({
+      runId,
+      // Strip the container path prefix so the UI shows project-relative paths.
+      file: file.replace(/^\/work\/repo\//, ""),
+      linesTotal: lines.total ?? 0,
+      linesCovered: lines.covered ?? 0,
+      pct: Math.round(lines.pct ?? 0),
+    });
+  }
+  return rows;
+}
+
+/**
+ * Records one pipeline step against the run so the run detail page has
+ * something to show. `exitCode` drives the status — non-zero is a failure.
+ */
+async function recordStep(
+  runId: string,
+  name: string,
+  kind: "unit" | "integration" | "e2e" | "snapshot" | null,
+  startedAtMs: number,
+  exitCode: number,
+): Promise<void> {
+  await db.insert(runSteps).values({
+    runId,
+    name,
+    kind,
+    status: exitCode === 0 ? "success" : "failure",
+    durationMs: Date.now() - startedAtMs,
+    exitCode,
+    startedAt: new Date(startedAtMs),
+    finishedAt: new Date(),
+  });
+}
+
+/**
+ * Specs are written as `<test_case.id>.test.tsx`, so the JUnit file path is how
+ * a reported test maps back to the case that produced it.
+ */
+function caseIdFromFile(file: string | null): string | null {
+  const fileName = (file ?? "").split("/").pop() ?? "";
+  const m = fileName.match(/^([0-9a-f-]{36})\.test\.(?:t|j)sx?$/);
+  return m && m[1] ? m[1] : null;
+}
+
+/** Maps a generated case's category onto the run's test_kind enum. */
+function testKindFor(category: string | undefined): "unit" | "integration" {
+  return category === "integration" ? "integration" : "unit";
 }
 
 async function markAllFailed(
@@ -181,21 +375,45 @@ async function markAllFailed(
     .where(inArray(testCases.id, ids));
 }
 
+/**
+ * Builds one install step for the container script.
+ *
+ * Installs are best-effort — a partial install can still produce a usable run,
+ * so the step always exits 0 and the `&&` chain continues. But it must not fail
+ * *silently*: on failure it prints a marker that survives into the stored run
+ * output, which the runner detects to report "install failed" instead of the
+ * baffling "Vitest produced no results".
+ *
+ * Output is routed through a file rather than piped to `tail`, because a pipe
+ * would mask the install's exit status and the container's /bin/sh (dash) has
+ * no `pipefail`.
+ */
+function installStep(command: string, label: string): string {
+  const logFile = `/tmp/install-${label.replace(/\W+/g, "-")}.log`;
+  return (
+    `{ if ${command} > ${logFile} 2>&1; then tail -20 ${logFile}; ` +
+    `else tail -50 ${logFile}; echo "${INSTALL_FAILED_MARKER} ${label}"; fi; }`
+  );
+}
+
 function installCommand(repoDir: string): string {
   if (existsSync(join(repoDir, "pnpm-lock.yaml"))) return "pnpm install --frozen-lockfile=false";
   if (existsSync(join(repoDir, "yarn.lock"))) return "yarn install --frozen-lockfile=false";
   return "npm install --no-audit --no-fund";
 }
 
-async function ensureVitestConfig(repoDir: string): Promise<void> {
-  const candidates = [
-    "vitest.config.ts",
-    "vitest.config.js",
-    "vitest.config.mts",
-    "vitest.config.mjs",
-  ];
-  if (candidates.some((c) => existsSync(join(repoDir, c)))) return;
-
+/**
+ * Writes the config Vitest runs our generated specs under.
+ *
+ * This is always written, never skipped. It lives under a dedicated filename
+ * (not `vitest.config.ts`) for two reasons: it must not clobber a config the
+ * target repo already ships, and — more importantly — a repo that ships its own
+ * `vitest.config.ts` used to make us skip writing ours entirely, which left the
+ * run with no `tests/ai/**` include glob, no happy-dom environment and no
+ * coverage settings. Every case then came back "no result reported by Vitest".
+ * The runner points Vitest at this file explicitly with `--config`.
+ */
+async function writeVitestConfig(repoDir: string): Promise<void> {
   const config = `import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 import tsconfigPaths from "vite-tsconfig-paths";
@@ -217,13 +435,33 @@ export default defineConfig({
     setupFiles: ["./tests/ai/setup.ts"],
     include: ["tests/ai/**/*.test.{ts,tsx,js,jsx}"],
     css: false,
+    pool: "forks",
+    testTimeout: 10000,
+    clearMocks: true,
+    coverage: {
+      provider: "v8",
+      reporter: ["json-summary", "json"],
+      reportsDirectory: "/work/coverage",
+      // Vitest defaults this to false, which silently discards the ENTIRE
+      // coverage report whenever any test fails. Generated suites almost
+      // always have at least one failure, so without this we never once
+      // produced coverage data.
+      reportOnFailure: true,
+      include: ["src/**/*.{ts,tsx}"],
+      exclude: [
+        "src/**/*.{test,spec}.{ts,tsx}",
+        "src/**/*.d.ts",
+        "tests/**",
+        "**/node_modules/**",
+      ],
+    },
   },
   esbuild: {
     jsx: "automatic",
   },
 });
 `;
-  await writeFile(join(repoDir, "vitest.config.ts"), config, "utf8");
+  await writeFile(join(repoDir, VITEST_CONFIG_FILENAME), config, "utf8");
 }
 
 async function ensureSetupFile(repoDir: string): Promise<void> {
@@ -244,10 +482,8 @@ function aggregatePerCase(
 ): Map<string, PerCaseResult> {
   const out = new Map<string, PerCaseResult>();
   for (const t of tests) {
-    const fileName = (t.file ?? "").split("/").pop() ?? "";
-    const m = fileName.match(/^([0-9a-f-]{36})\.test\.(?:t|j)sx?$/);
-    if (!m || !m[1]) continue;
-    const caseId = m[1];
+    const caseId = caseIdFromFile(t.file);
+    if (!caseId) continue;
     const prev = out.get(caseId);
     const status =
       prev?.status === "failed" || t.status === "failed"
@@ -263,66 +499,6 @@ function aggregatePerCase(
     });
   }
   return out;
-}
-
-/**
- * Apply all known AI-antipattern rewrites in order.
- */
-function sanitizeTestCode(code: string): string {
-  let out = sanitizeNestedRouter(code);
-  out = sanitizeGetByText(out);
-  return out;
-}
-
-/**
- * Rewrite `expect(screen.getByText(X)).toBeInTheDocument()` to
- * `expect(document.body).toHaveTextContent(X)`.
- *
- * `getByText` matches text that lives entirely in a single element. The AI
- * keeps using it for content that's actually split across elements (a styled
- * span inside a heading, for example), which produces "Unable to find an
- * element with the text" failures even when the rendered DOM contains the
- * expected words. `toHaveTextContent` walks the subtree, which is what the
- * AI actually means.
- */
-function sanitizeGetByText(code: string): string {
-  // Conservative match: only handle the explicit toBeInTheDocument assertion
-  // form. We leave standalone getByText() calls alone — they might be used
-  // for click handlers etc.
-  return code.replace(
-    /expect\s*\(\s*screen\.getByText\s*\(\s*([^)]+?)\s*\)\s*\)\s*\.toBeInTheDocument\s*\(\s*\)/g,
-    "expect(document.body).toHaveTextContent($1)",
-  );
-}
-
-/**
- * Detect and rewrite `render(<MemoryRouter|BrowserRouter|HashRouter ...><App /></...>)`
- * — a recurring AI mistake. `App.tsx` usually mounts its own Router; wrapping
- * <App /> in another Router throws "You cannot render a <Router> inside another <Router>".
- *
- * MemoryRouter with initialEntries → push the route via window.history first, then render <App />.
- * BrowserRouter / HashRouter wrapping <App /> → unwrap (App brings its own router).
- *
- * Kept in sync with packages/ai/src/generateTests.ts to defend even on cases
- * generated before that sanitizer was added.
- */
-function sanitizeNestedRouter(code: string): string {
-  const memoryRe =
-    /render\s*\(\s*<MemoryRouter\b([^>]*)>\s*<App\s*\/>\s*<\/MemoryRouter>\s*\)\s*;?/gs;
-  let out = code.replace(memoryRe, (_match, attrs: string) => {
-    const route = extractInitialRoute(attrs) ?? "/";
-    return `window.history.pushState({}, "", ${JSON.stringify(route)}); render(<App />);`;
-  });
-  out = out.replace(
-    /render\s*\(\s*<(BrowserRouter|HashRouter)\b[^>]*>\s*<App\s*\/>\s*<\/\1>\s*\)\s*;?/gs,
-    "render(<App />);",
-  );
-  return out;
-}
-
-function extractInitialRoute(attrs: string): string | null {
-  const m = attrs.match(/initialEntries\s*=\s*\{\s*\[\s*["'`]([^"'`]+)["'`]/);
-  return m && m[1] ? m[1] : null;
 }
 
 function combineOutput(r: { stdout: string; stderr: string; exitCode: number }): string {
