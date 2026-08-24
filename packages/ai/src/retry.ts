@@ -3,10 +3,11 @@
  */
 export async function withRetry<T>(
   fn: () => Promise<T>,
-  opts: { attempts?: number; baseDelayMs?: number } = {},
+  opts: { attempts?: number; baseDelayMs?: number; maxDelayMs?: number } = {},
 ): Promise<T> {
   const attempts = opts.attempts ?? 4;
   const base = opts.baseDelayMs ?? 1500;
+  const maxDelay = opts.maxDelayMs ?? 30_000;
   let lastErr: unknown;
   for (let i = 0; i < attempts; i++) {
     try {
@@ -14,11 +15,33 @@ export async function withRetry<T>(
     } catch (err) {
       lastErr = err;
       if (i === attempts - 1 || !isRetryable(err)) break;
-      const delay = base * Math.pow(2, i) + Math.random() * 400;
+      const backoff = base * Math.pow(2, i) + Math.random() * 400;
+      // When the API tells us how long to wait, believe it. Rate-limit replies
+      // carry a retryDelay (observed at 34-40s) that our backoff tops out well
+      // below, so pure exponential backoff burns every attempt too early and
+      // fails a call that a single longer wait would have completed.
+      const advised = retryAfterMs(err);
+      const delay = Math.min(Math.max(backoff, advised ?? 0), maxDelay);
       await new Promise((r) => setTimeout(r, delay));
     }
   }
   throw lastErr;
+}
+
+/**
+ * The wait the API asked for, in ms, or null if it didn't say.
+ *
+ * Google returns this as a RetryInfo entry in the error body, which reaches us
+ * as text on the error message — as `retryDelay: '34s'` or `"retryDelay":"34s"`
+ * depending on how it was serialised.
+ */
+export function retryAfterMs(err: unknown): number | null {
+  if (!err) return null;
+  const msg = err instanceof Error ? err.message : String(err);
+  const m = msg.match(/retryDelay["']?\s*[:=]\s*["']?(\d+(?:\.\d+)?)s/i);
+  if (!m || !m[1]) return null;
+  const seconds = Number(m[1]);
+  return Number.isFinite(seconds) && seconds > 0 ? Math.ceil(seconds * 1000) : null;
 }
 
 export function isRetryable(err: unknown): boolean {
