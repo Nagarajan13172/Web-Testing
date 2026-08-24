@@ -15,8 +15,8 @@
     "db:migrate": "pnpm --filter @webtesting/db migrate",
     "db:studio": "pnpm --filter @webtesting/db studio",
     "sandbox:build": "docker build -f docker/node.Dockerfile -t webtesting/node:latest docker",
-    "sandbox:pull-playwright": "docker pull mcr.microsoft.com/playwright:v1.50.0-noble",
     "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
     "lint": "pnpm -r lint"
   },
   "devDependencies": {

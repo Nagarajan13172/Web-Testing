@@ -6,6 +6,13 @@ export {
 } from "./explainFailure";
 
 export {
+  sanitizeTestCode,
+  sanitizeNestedRouter,
+  sanitizeGetByText,
+  sanitizeRelativeImportDepth,
+} from "./sanitize";
+
+export {
   generateTests,
   TEST_GEN_MODEL,
   type GenerateTestsInput,
@@ -14,7 +21,3 @@ export {
   type TestCaseCategory,
   type RepoContextFile,
 } from "./generateTests";
-
-export async function reviewDiff(): Promise<never> {
-  throw new Error("ai.reviewDiff not implemented — see MVP step 8 in the plan");
-}
