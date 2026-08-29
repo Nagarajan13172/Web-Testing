@@ -15,7 +15,7 @@ and line coverage.
 | Queue | BullMQ on Redis 7 via Docker Compose |
 | ORM | Drizzle |
 | AI | Google Gemini (`gemini-2.5-flash`) |
-| Sandbox | Docker (`webtesting/node:latest`) |
+| Sandbox | Docker — `webtesting/node:latest` (Vitest), `mcr.microsoft.com/playwright` (E2E) |
 
 ## What works today
 
@@ -24,8 +24,14 @@ and line coverage.
 - **AI test generation** — 6–10 Vitest + RTL cases per repo, stored as editable test cases.
 - **Hand-written test cases** — write your own spec and run it on the same pipeline.
   Needs no model quota and no GitHub App. See below for how these are protected.
-- **Sandboxed runs** — clone → inject specs under `tests/ai/` → run in Docker → parse
-  JUnit back to per-case pass/fail with failure messages and stack traces.
+- **Two runners, chosen per repo** via `repos.test_runner_kind`:
+  - **`vitest`** — component tests. Clones the repo, injects specs under `tests/ai/`,
+    mounts components in happy-dom, and collects line coverage.
+  - **`playwright`** — end-to-end tests. Drives `repos.target_domain` in a real
+    browser. No checkout and no install: the app under test is already running
+    somewhere, which also means there is no coverage to collect.
+- **Sandboxed runs** — Docker in both cases, JUnit parsed back to per-case pass/fail
+  with failure messages and stack traces.
 - **Self-repair** — a spec that fails goes back to the model with its actual error
   and the source of the components it imports, and the suite is re-run. Generation
   can only predict what a component renders; this pass sees what really happened.
@@ -41,15 +47,20 @@ React only, and detection gates on it: `next-app`, `next-pages`, `vite-react`, `
 
 ### Not built yet
 
-- **Browser / E2E tests** — Vitest in happy-dom only. There is no Playwright runner.
+- **Stored failure artifacts** — the Playwright runner captures screenshots, traces
+  and video on failure, but they are discarded with the workspace rather than kept
+  and shown. Replayable failures are the next step for the E2E path.
+- **Per-case runner** — the runner is chosen per repo, so a repo can hold component
+  tests or end-to-end tests but not usefully both. Mixed suites need the runner to
+  move onto the case.
 - **PR creation** — nothing opens a PR with the generated tests.
 - **AI diff review** — changed code is not reviewed.
 - **Secrets vault** — the `secrets` table and `SECRET_VAULT_KEY` exist; there is no code.
 - **Python / Java / Go** — JS/TS only.
 
-Earlier drafts of a Playwright runner, a PR-opening helper and a diff reviewer were
-removed rather than left in place unwired — they described capabilities the platform
-did not have. They're in git history if you want them back.
+Earlier drafts of a PR-opening helper and a diff reviewer were removed rather than
+left in place unwired — they described capabilities the platform did not have.
+They're in git history if you want them back.
 
 ## Prerequisites
 
@@ -97,8 +108,10 @@ Clerk and GitHub App keys are required for sign-in and repo sync respectively.
 │   ├── web/                 # Next.js app + API routes
 │   └── worker/              # BullMQ worker
 │       └── src/
-│           ├── vitest-runner.ts    # the AI test-case path (current product)
-│           └── orchestrator.ts     # the legacy git-push CI path
+│           ├── vitest-runner.ts      # component tests, in a checkout
+│           ├── playwright-runner.ts  # end-to-end tests, against a deployed URL
+│           ├── run-shared.ts         # JUnit -> results persistence, shared
+│           └── orchestrator.ts       # the legacy git-push CI path
 ├── packages/
 │   ├── db/                  # Drizzle schema + migrations
 │   ├── ai/                  # Gemini wrappers + generated-code sanitizers

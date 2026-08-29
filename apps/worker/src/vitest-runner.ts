@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -8,8 +7,6 @@ import {
   testCases,
   repos,
   runs,
-  runSteps,
-  testResults,
   coverage,
   eq,
   inArray,
@@ -17,6 +14,15 @@ import {
 import { parseJunit } from "@webtesting/junit-parser";
 import { sanitizeTestCode } from "@webtesting/ai/sanitize";
 import { repairTest, localImportPaths } from "@webtesting/ai/repairTest";
+import {
+  execHost,
+  combineOutput,
+  recordStep,
+  markAllFailed,
+  aggregatePerCase,
+  persistResults,
+  type PerCaseResult,
+} from "./run-shared";
 import { installationAccessToken, tokenizedCloneUrl } from "./github";
 import type { Logger } from "./orchestrator";
 
@@ -217,63 +223,16 @@ export async function runVitestCases(input: RunVitestInput, log: Logger): Promis
       combinedOutput = next.combinedOutput;
     }
 
-    const perCase = aggregatePerCase(parsed.tests);
-    const seen = new Set(perCase.keys());
-
-    // ---- Per-test rows ---------------------------------------------------
-    // The run detail page reads test_results / run_steps. Without these a
-    // run created by this path renders as an empty shell, and the "explain
-    // this failure" button has nothing to attach to.
-    const caseById = new Map(cases.map((c) => [c.id, c]));
-    const resultRows = parsed.tests.map((t) => {
-      const caseId = caseIdFromFile(t.file);
-      const c = caseId ? caseById.get(caseId) : undefined;
-      return {
-        runId,
-        kind: testKindFor(c?.category),
-        file: t.file || "unknown",
-        // The on-disk filename is a UUID, so surface the case title instead —
-        // it's what the dashboard shows and the only human-readable handle.
-        suite: c?.title ?? t.suite,
-        name: t.name,
-        status: t.status,
-        durationMs: t.durationMs,
-        failureMessage: t.failureMessage,
-        failureStack: t.failureStack,
-      };
-    });
-    if (resultRows.length > 0) {
-      await db.insert(testResults).values(resultRows);
-      log("test results stored", { count: resultRows.length });
-    }
-
-    await db.transaction(async (tx) => {
-      for (const [caseId, r] of perCase.entries()) {
-        await tx
-          .update(testCases)
-          .set({
-            status: r.status === "skipped" ? "pending" : r.status,
-            lastRunAt: new Date(),
-            lastDurationMs: r.durationMs,
-            lastFailureMessage: r.failureMessage,
-            lastFailureStack: r.failureStack,
-            lastRunOutput: combinedOutput,
-          })
-          .where(eq(testCases.id, caseId));
-      }
-      const missing = testCaseIds.filter((id) => !seen.has(id));
-      if (missing.length > 0) {
-        await tx
-          .update(testCases)
-          .set({
-            status: "failed",
-            lastRunAt: new Date(),
-            lastFailureMessage:
-              "no result reported by Vitest (likely a syntax error or unresolved import)",
-            lastRunOutput: combinedOutput,
-          })
-          .where(inArray(testCases.id, missing));
-      }
+    await persistResults({
+      runId,
+      testCaseIds,
+      cases,
+      parsed,
+      combinedOutput,
+      defaultKind: "unit",
+      missingMessage:
+        "no result reported by Vitest (likely a syntax error or unresolved import)",
+      log,
     });
 
     if (parsed.totals.failed > 0) finalStatus = "failure";
@@ -530,60 +489,6 @@ async function readImportedSources(
 }
 
 /**
- * Records one pipeline step against the run so the run detail page has
- * something to show. `exitCode` drives the status — non-zero is a failure.
- */
-async function recordStep(
-  runId: string,
-  name: string,
-  kind: "unit" | "integration" | "e2e" | "snapshot" | null,
-  startedAtMs: number,
-  exitCode: number,
-): Promise<void> {
-  await db.insert(runSteps).values({
-    runId,
-    name,
-    kind,
-    status: exitCode === 0 ? "success" : "failure",
-    durationMs: Date.now() - startedAtMs,
-    exitCode,
-    startedAt: new Date(startedAtMs),
-    finishedAt: new Date(),
-  });
-}
-
-/**
- * Specs are written as `<test_case.id>.test.tsx`, so the JUnit file path is how
- * a reported test maps back to the case that produced it.
- */
-function caseIdFromFile(file: string | null): string | null {
-  const fileName = (file ?? "").split("/").pop() ?? "";
-  const m = fileName.match(/^([0-9a-f-]{36})\.test\.(?:t|j)sx?$/);
-  return m && m[1] ? m[1] : null;
-}
-
-/** Maps a generated case's category onto the run's test_kind enum. */
-function testKindFor(category: string | undefined): "unit" | "integration" {
-  return category === "integration" ? "integration" : "unit";
-}
-
-async function markAllFailed(
-  ids: string[],
-  message: string,
-  output: string,
-): Promise<void> {
-  await db
-    .update(testCases)
-    .set({
-      status: "failed",
-      lastRunAt: new Date(),
-      lastFailureMessage: message,
-      lastRunOutput: output,
-    })
-    .where(inArray(testCases.id, ids));
-}
-
-/**
  * Builds one install step for the container script.
  *
  * Installs are best-effort — a partial install can still produce a usable run,
@@ -701,72 +606,4 @@ async function ensureSetupFile(repoDir: string): Promise<void> {
   const setupPath = join(repoDir, "tests", "ai", "setup.ts");
   if (existsSync(setupPath)) return;
   await writeFile(setupPath, `import "@testing-library/jest-dom/vitest";\n`, "utf8");
-}
-
-interface PerCaseResult {
-  status: "passed" | "failed" | "skipped";
-  durationMs: number;
-  failureMessage: string | null;
-  failureStack: string | null;
-}
-
-function aggregatePerCase(
-  tests: ReturnType<typeof parseJunit>["tests"],
-): Map<string, PerCaseResult> {
-  const out = new Map<string, PerCaseResult>();
-  for (const t of tests) {
-    const caseId = caseIdFromFile(t.file);
-    if (!caseId) continue;
-    const prev = out.get(caseId);
-    const status =
-      prev?.status === "failed" || t.status === "failed"
-        ? "failed"
-        : prev?.status === "passed" || t.status === "passed"
-          ? "passed"
-          : t.status;
-    out.set(caseId, {
-      status,
-      durationMs: (prev?.durationMs ?? 0) + (t.durationMs ?? 0),
-      failureMessage: t.status === "failed" ? t.failureMessage : prev?.failureMessage ?? null,
-      failureStack: t.status === "failed" ? t.failureStack : prev?.failureStack ?? null,
-    });
-  }
-  return out;
-}
-
-function combineOutput(r: { stdout: string; stderr: string; exitCode: number }): string {
-  const sections: string[] = [];
-  if (r.stdout.trim()) sections.push(`--- stdout ---\n${r.stdout.trim()}`);
-  if (r.stderr.trim()) sections.push(`--- stderr ---\n${r.stderr.trim()}`);
-  sections.push(`--- exit code: ${r.exitCode} ---`);
-  return sections.join("\n\n");
-}
-
-interface ExecOptions {
-  timeoutMs: number;
-  log: Logger;
-}
-
-interface ExecResult {
-  exitCode: number;
-  stdout: string;
-  stderr: string;
-}
-
-function execHost(cmd: string, args: string[], opts: ExecOptions): Promise<ExecResult> {
-  return new Promise((resolve) => {
-    const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    const timer = setTimeout(() => {
-      opts.log("timeout — killing", { cmd, args: args.slice(0, 3) });
-      child.kill("SIGKILL");
-    }, opts.timeoutMs);
-    child.stdout.on("data", (d) => (stdout += d.toString()));
-    child.stderr.on("data", (d) => (stderr += d.toString()));
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      resolve({ exitCode: code ?? -1, stdout, stderr });
-    });
-  });
 }

@@ -3,6 +3,7 @@ import { db, runs, testCases, eq, inArray } from "@webtesting/db";
 import { RUNS_QUEUE, connection, type RunJob } from "./queue";
 import { runJob } from "./orchestrator";
 import { runVitestCases } from "./vitest-runner";
+import { runPlaywrightCases } from "./playwright-runner";
 
 const worker = new Worker<RunJob>(
   RUNS_QUEUE,
@@ -13,14 +14,12 @@ const worker = new Worker<RunJob>(
       console.log(JSON.stringify({ ts: new Date().toISOString(), event, job: tag, ...data }));
 
     if (job.data.kind === "test-cases") {
-      log("test-cases picked up", {
-        count: job.data.testCaseIds.length,
-        runner: "vitest",
-      });
-      await runVitestCases(
-        { repoId: job.data.repoId, testCaseIds: job.data.testCaseIds },
-        log,
-      );
+      // The enqueuing route resolves this from the repo's configured runner.
+      const runner = job.data.runnerKind ?? "vitest";
+      log("test-cases picked up", { count: job.data.testCaseIds.length, runner });
+      const args = { repoId: job.data.repoId, testCaseIds: job.data.testCaseIds };
+      if (runner === "playwright") await runPlaywrightCases(args, log);
+      else await runVitestCases(args, log);
       return;
     }
 

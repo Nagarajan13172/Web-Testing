@@ -14,7 +14,7 @@ export interface TestCasesJob {
   kind: "test-cases";
   repoId: string;
   testCaseIds: string[];
-  runnerKind: "vitest";
+  runnerKind: "vitest" | "playwright";
 }
 
 export type RunJob = GitPushJob | TestCasesJob;

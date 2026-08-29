@@ -37,12 +37,24 @@ export async function POST(
     .limit(1);
   if (!repo) return NextResponse.json({ error: "repo not found" }, { status: 404 });
 
-  if (!repo.framework || !isSupportedFramework(repo.framework as never)) {
+  const runnerKind = repo.testRunnerKind === "playwright" ? "playwright" : "vitest";
+
+  // Vitest mounts the repo's own components, so the stack has to be one we can
+  // build. Playwright only drives a URL over HTTP — the app could be written in
+  // anything — so the framework gate doesn't apply to it.
+  if (runnerKind === "vitest" && (!repo.framework || !isSupportedFramework(repo.framework as never))) {
     return NextResponse.json(
       {
-        error: "Only React projects are supported right now.",
+        error: "Only React projects are supported for component tests. Switch this repo to end-to-end tests to run against a deployed URL.",
         framework: repo.framework,
       },
+      { status: 400 },
+    );
+  }
+
+  if (runnerKind === "playwright" && !repo.targetDomain) {
+    return NextResponse.json(
+      { error: "Set the deployed URL for this repo before running end-to-end tests." },
       { status: 400 },
     );
   }
@@ -69,12 +81,12 @@ export async function POST(
       kind: "test-cases",
       repoId: repo.id,
       testCaseIds: validIds,
-      runnerKind: "vitest",
+      runnerKind,
     },
     { removeOnComplete: 1000, removeOnFail: 1000, attempts: 1 },
   );
 
-  return NextResponse.json({ enqueued: validIds.length, runnerKind: "vitest" });
+  return NextResponse.json({ enqueued: validIds.length, runnerKind });
 }
 
 function isUuid(s: string) {
