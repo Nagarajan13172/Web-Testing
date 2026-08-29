@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { db, testCases, repos, eq, and } from "@webtesting/db";
 import { requireUser } from "@/lib/auth";
+import { validateSpec } from "@/lib/validate-spec";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -12,6 +13,8 @@ interface PatchBody {
   expectedResult?: string | null;
   category?: string;
   playwrightCode?: string;
+  /** Only "manual" is accepted — see the handler. */
+  source?: "manual";
 }
 
 export async function PATCH(
@@ -47,19 +50,43 @@ export async function PATCH(
     update.expectedResult = body.expectedResult === null ? null : String(body.expectedResult).trim() || null;
   }
   if (typeof body.playwrightCode === "string" && body.playwrightCode.trim()) {
+    const syntax = await validateSpec(body.playwrightCode);
+    if (!syntax.ok) {
+      return NextResponse.json(
+        { error: `spec does not parse — ${syntax.message}` },
+        { status: 400 },
+      );
+    }
     update.playwrightCode = body.playwrightCode;
+  }
+
+  // Adopting a generated case marks it as yours: from then on it is never
+  // rewritten by the sanitizers, never sent to the repair pass, and never
+  // deleted by Regenerate. Only ai -> manual is allowed; the reverse would
+  // quietly re-expose hand-written work to all three.
+  if (body.source === "manual") {
+    update.source = "manual";
+  } else if (body.source !== undefined) {
+    return NextResponse.json(
+      { error: "source can only be changed to \"manual\"" },
+      { status: 400 },
+    );
   }
 
   if (Object.keys(update).length === 0) {
     return NextResponse.json({ error: "no fields to update" }, { status: 400 });
   }
 
-  // The reference platform mentions clearing pre-generated scripts when
-  // requirements change. We reset status to "pending" so the user knows the
-  // case needs re-running (and the stale failure context disappears).
-  update.status = "pending";
-  update.lastFailureMessage = null;
-  update.lastFailureStack = null;
+  // Changing what a case asserts invalidates its last result, so reset it to
+  // pending and drop the stale failure. Adopting a case changes only who owns
+  // it — the spec and its result are untouched, so a passing case must not be
+  // knocked back to pending for it.
+  const requirementsChanged = Object.keys(update).some((k) => k !== "source");
+  if (requirementsChanged) {
+    update.status = "pending";
+    update.lastFailureMessage = null;
+    update.lastFailureStack = null;
+  }
 
   const [updated] = await db
     .update(testCases)

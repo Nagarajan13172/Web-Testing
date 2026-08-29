@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { db, repos, testCases, eq, and, asc } from "@webtesting/db";
 import { requireUser } from "@/lib/auth";
+import { validateSpec } from "@/lib/validate-spec";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -108,6 +109,14 @@ export async function POST(
   }
   if (!code || !code.trim()) {
     return NextResponse.json({ error: "code is required" }, { status: 400 });
+  }
+
+  const syntax = await validateSpec(code);
+  if (!syntax.ok) {
+    return NextResponse.json(
+      { error: `spec does not parse — ${syntax.message}` },
+      { status: 400 },
+    );
   }
 
   const [created] = await db

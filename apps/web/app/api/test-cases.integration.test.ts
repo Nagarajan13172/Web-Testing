@@ -142,6 +142,82 @@ describe("PATCH /api/test-cases/[id]", () => {
   });
 });
 
+describe("spec syntax validation", () => {
+  it("rejects a spec that does not parse, and names the line", async () => {
+    const broken = `import { it } from "vitest";\nit("x", () => {\n  expect(1).toBe(1);\n`; // unclosed
+    const res = await POST(post({ title: "broken", code: broken }), params(ctx.repoId));
+    expect(res.status).toBe(400);
+    const { error } = await res.json();
+    expect(error).toMatch(/does not parse/i);
+    expect(error).toMatch(/line \d+/);
+  });
+
+  it("accepts TSX, which is what these specs actually are", async () => {
+    const tsx = `import { render } from "@testing-library/react";\n` +
+      `const El = () => <div className="x">hi</div>;\n` +
+      `it("renders", () => { render(<El />); });\n`;
+    expect((await POST(post({ title: "tsx", code: tsx }), params(ctx.repoId))).status).toBe(201);
+  });
+
+  it("rejects unparseable code on edit too, leaving the stored spec intact", async () => {
+    const created = (await (await POST(post({ title: "keeper", code: SPEC }), params(ctx.repoId))).json()).case;
+    const res = await PATCH(
+      new Request("http://localhost/x", {
+        method: "PATCH", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ playwrightCode: "it('x', () => {" }),
+      }),
+      params(created.id),
+    );
+    expect(res.status).toBe(400);
+    const [row] = await db.select().from(testCases).where(eq(testCases.id, created.id));
+    expect(row!.playwrightCode).toBe(SPEC);
+  });
+});
+
+describe("adopting a generated case", () => {
+  async function makeGenerated(status: "pending" | "passed" = "pending") {
+    const [row] = await db.insert(testCases).values({
+      repoId: ctx.repoId, title: "generated", description: "", category: "component",
+      source: "ai", status, playwrightCode: SPEC,
+    }).returning();
+    return row!;
+  }
+  const patch = (id: string, body: unknown) =>
+    PATCH(new Request("http://localhost/x", {
+      method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }), params(id));
+
+  it("flips source to manual", async () => {
+    const gen = await makeGenerated();
+    expect((await patch(gen.id, { source: "manual" })).status).toBe(200);
+    const [row] = await db.select().from(testCases).where(eq(testCases.id, gen.id));
+    expect(row!.source).toBe("manual");
+  });
+
+  // Adoption changes ownership, not what the case asserts — knocking a green
+  // case back to pending would misreport it as never having run.
+  it("does not reset a passing case to pending", async () => {
+    const gen = await makeGenerated("passed");
+    await patch(gen.id, { source: "manual" });
+    const [row] = await db.select().from(testCases).where(eq(testCases.id, gen.id));
+    expect(row!.status).toBe("passed");
+  });
+
+  it("still resets to pending when the spec itself changes", async () => {
+    const gen = await makeGenerated("passed");
+    await patch(gen.id, { title: "new requirements" });
+    const [row] = await db.select().from(testCases).where(eq(testCases.id, gen.id));
+    expect(row!.status).toBe("pending");
+  });
+
+  it("refuses to un-adopt, which would re-expose the case to rewrites", async () => {
+    const gen = await makeGenerated();
+    const res = await patch(gen.id, { source: "ai" });
+    expect(res.status).toBe(400);
+  });
+});
+
 describe("regeneration scoping", () => {
   it("deletes generated cases and preserves hand-written ones", async () => {
     await db.insert(testCases).values([
