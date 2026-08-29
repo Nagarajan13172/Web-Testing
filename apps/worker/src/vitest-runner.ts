@@ -125,15 +125,28 @@ export async function runVitestCases(input: RunVitestInput, log: Logger): Promis
     }
 
     // ---- Write generated specs ------------------------------------------
-    const aiTestsDir = join(repoDir, "tests", "ai");
-    await mkdir(aiTestsDir, { recursive: true });
+    // Still "tests/ai" on disk: the generation prompt tells the model this
+    // exact path so it can compute relative imports, and that can't be
+    // re-verified while the model quota is exhausted. Worth renaming to
+    // tests/webtesting once generation can be exercised again.
+    const specsDir = join(repoDir, "tests", "ai");
+    await mkdir(specsDir, { recursive: true });
     let healed = 0;
     for (const c of cases) {
       const fname = `${c.id}.test.tsx`;
+
+      // Hand-written cases run exactly as written. The sanitizers exist to fix
+      // the model's recurring mistakes; silently rewriting a person's code
+      // would hide their real failure and overwrite what they typed.
+      if (c.source === "manual") {
+        await writeFile(join(specsDir, fname), c.playwrightCode, "utf8");
+        continue;
+      }
+
       // Defensively rewrite known AI antipatterns at runtime so older stored
       // cases (generated before the sanitizer was added) self-heal.
       const sanitized = sanitizeTestCode(c.playwrightCode);
-      await writeFile(join(aiTestsDir, fname), sanitized, "utf8");
+      await writeFile(join(specsDir, fname), sanitized, "utf8");
 
       // Persist the rewrite. Without this the stored case keeps the broken
       // original — so the editor shows code that would fail if anyone ran or
@@ -439,6 +452,14 @@ async function repairFailedCases(args: RepairArgs): Promise<number> {
     const c = byId.get(caseId);
     if (!c) continue;
     const short = caseId.slice(0, 8);
+
+    // Never rewrite someone's own test. A failing hand-written spec is a
+    // result the user asked for — replacing it with model output would
+    // destroy their work and hide what they were trying to assert.
+    if (c.source === "manual") {
+      log("skipping repair for manual case", { case: short });
+      continue;
+    }
     try {
       const current = await readFile(
         join(repoDir, "tests", "ai", `${caseId}.test.tsx`),

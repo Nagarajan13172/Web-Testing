@@ -70,6 +70,32 @@ export async function PATCH(
   return NextResponse.json({ case: updated });
 }
 
+/** Remove a single test case. Generated cases are also removable — regenerating
+ *  replaces them anyway, and a case nobody wants shouldn't be un-deletable. */
+export async function DELETE(
+  _req: Request,
+  { params }: { params: Promise<{ id: string }> },
+) {
+  const { id } = await params;
+  if (!isUuid(id)) {
+    return NextResponse.json({ error: "invalid id" }, { status: 400 });
+  }
+
+  const { org } = await requireUser();
+
+  // Authorize via the repo->org chain before touching anything.
+  const [row] = await db
+    .select({ caseId: testCases.id })
+    .from(testCases)
+    .innerJoin(repos, eq(testCases.repoId, repos.id))
+    .where(and(eq(testCases.id, id), eq(repos.orgId, org.id)))
+    .limit(1);
+  if (!row) return NextResponse.json({ error: "test case not found" }, { status: 404 });
+
+  await db.delete(testCases).where(eq(testCases.id, id));
+  return NextResponse.json({ deleted: id });
+}
+
 function isUuid(s: string) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
 }

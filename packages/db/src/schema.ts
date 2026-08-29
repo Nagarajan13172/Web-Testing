@@ -56,6 +56,17 @@ export const testCaseStatusEnum = pgEnum("test_case_status", [
   "failed",
 ]);
 
+/**
+ * Who wrote a test case.
+ *
+ * This is not cosmetic — it gates three destructive behaviours that are correct
+ * for generated cases and wrong for hand-written ones: regeneration wipes the
+ * repo's cases, the runner rewrites stored code through the sanitizers, and the
+ * repair pass replaces a failing spec with model output. None of those may
+ * touch something a person wrote.
+ */
+export const testCaseSourceEnum = pgEnum("test_case_source", ["ai", "manual"]);
+
 /* ---------- users / orgs ---------- */
 
 export const users = pgTable("users", {
@@ -110,6 +121,8 @@ export const testCases = pgTable(
     title: text("title").notNull(),
     description: text("description").notNull(),
     category: text("category").notNull(),
+    // Existing rows predate manual authoring, so "ai" is the right backfill.
+    source: testCaseSourceEnum("source").notNull().default("ai"),
     status: testCaseStatusEnum("status").notNull().default("pending"),
     targetRoute: text("target_route"),
     expectedResult: text("expected_result"),

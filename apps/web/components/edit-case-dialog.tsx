@@ -23,9 +23,36 @@ export interface EditableCase {
 interface Props {
   open: boolean;
   onClose: () => void;
+  /** The case being edited. Null in "create" mode. */
   caseData: EditableCase | null;
+  /** Required in "create" mode — the repo the new case belongs to. */
+  repoId?: string;
+  mode?: "edit" | "create";
   onSaved: (updated: EditableCase) => void;
+  /** Called with the newly created case so the card can show it immediately. */
+  onCreated?: (created: EditableCase) => void;
 }
+
+/**
+ * Starting point for a hand-written spec.
+ *
+ * The import depth is not incidental: the runner writes every spec to
+ * tests/ai/<id>.test.tsx, two directories below the repo root, so source
+ * imports need "../../". Handing the user a skeleton that already gets this
+ * right avoids the single most common way a first manual test fails.
+ */
+const STARTER_SPEC = `import { describe, it, expect } from "vitest";
+import { render, screen } from "@testing-library/react";
+import "@testing-library/jest-dom/vitest";
+import Component from "../../src/components/Component";
+
+describe("Component", () => {
+  it("renders", () => {
+    render(<Component />);
+    expect(screen.getByRole("heading", { name: /hello/i })).toBeInTheDocument();
+  });
+});
+`;
 
 const CATEGORY_OPTIONS = [
   "ui",
@@ -39,7 +66,16 @@ const CATEGORY_OPTIONS = [
   "util",
 ] as const;
 
-export function EditCaseDialog({ open, onClose, caseData, onSaved }: Props) {
+export function EditCaseDialog({
+  open,
+  onClose,
+  caseData,
+  repoId,
+  mode = "edit",
+  onSaved,
+  onCreated,
+}: Props) {
+  const isCreate = mode === "create";
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [category, setCategory] = useState("ui");
@@ -51,6 +87,18 @@ export function EditCaseDialog({ open, onClose, caseData, onSaved }: Props) {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    if (isCreate) {
+      if (!open) return;
+      setTitle("");
+      setDescription("");
+      setCategory("component");
+      setTargetRoute("");
+      setExpectedResult("");
+      setPlaywrightCode(STARTER_SPEC);
+      setShowCode(true); // the code IS the case — never hide it here
+      setError(null);
+      return;
+    }
     if (!caseData) return;
     setTitle(caseData.title);
     setDescription(caseData.description);
@@ -60,9 +108,38 @@ export function EditCaseDialog({ open, onClose, caseData, onSaved }: Props) {
     setPlaywrightCode(caseData.playwrightCode ?? "");
     setShowCode(false);
     setError(null);
-  }, [caseData]);
+  }, [caseData, isCreate, open]);
+
+  async function create() {
+    if (!repoId) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const res = await fetch(`/api/repos/${repoId}/test-cases`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: title.trim(),
+          description: description.trim(),
+          category,
+          code: playwrightCode,
+          targetRoute: targetRoute.trim() || null,
+          expectedResult: expectedResult.trim() || null,
+        }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json.error ?? `request failed: ${res.status}`);
+      onCreated?.(json.case as EditableCase);
+      onClose();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "unknown error");
+    } finally {
+      setSaving(false);
+    }
+  }
 
   async function save() {
+    if (isCreate) return create();
     if (!caseData) return;
     setSaving(true);
     setError(null);
@@ -105,11 +182,25 @@ export function EditCaseDialog({ open, onClose, caseData, onSaved }: Props) {
     <Modal open={open} onOpenChange={(o) => !o && onClose()}>
       <ModalContent className="max-w-xl">
         <ModalHeader>
-          <ModalTitle>Edit testing requirements</ModalTitle>
+          <ModalTitle>{isCreate ? "Write a test case" : "Edit testing requirements"}</ModalTitle>
           <ModalDescription className="text-xs">
-            Modifying these parameters resets the case to <span className="font-mono">pending</span> so
-            the next run reflects the new requirements. Click <strong>Regenerate</strong> on the repo
-            card to rewrite the test code from the updated description.
+            {isCreate ? (
+              <>
+                Your spec runs exactly as written — it is never rewritten by the
+                sanitizers or replaced by the AI repair pass, and{" "}
+                <strong>Regenerate</strong> will not delete it. It is saved to{" "}
+                <span className="font-mono">tests/ai/&lt;id&gt;.test.tsx</span>, two directories
+                below the repo root, so import source as{" "}
+                <span className="font-mono">../../src/...</span>.
+              </>
+            ) : (
+              <>
+                Modifying these parameters resets the case to{" "}
+                <span className="font-mono">pending</span> so the next run reflects the new
+                requirements. Click <strong>Regenerate</strong> on the repo card to rewrite the
+                test code from the updated description.
+              </>
+            )}
           </ModalDescription>
         </ModalHeader>
 
@@ -165,7 +256,7 @@ export function EditCaseDialog({ open, onClose, caseData, onSaved }: Props) {
             />
           </Field>
 
-          {playwrightCode && (
+          {(playwrightCode || isCreate) && (
             <div>
               <button
                 type="button"
@@ -173,7 +264,9 @@ export function EditCaseDialog({ open, onClose, caseData, onSaved }: Props) {
                 className="mb-1.5 inline-flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground transition-colors hover:text-foreground"
               >
                 <Code2 className="h-3 w-3" strokeWidth={1.75} />
-                Vitest test code (advanced — edit directly to override the AI)
+                {isCreate
+                  ? "Vitest test code (required)"
+                  : "Vitest test code (advanced — edit directly to override the AI)"}
                 <ChevronDown
                   className={`h-3 w-3 transition-transform ${showCode ? "rotate-180" : ""}`}
                   strokeWidth={1.75}
@@ -220,7 +313,8 @@ export function EditCaseDialog({ open, onClose, caseData, onSaved }: Props) {
           <button
             type="button"
             onClick={save}
-            disabled={saving || !title.trim()}
+            // A manual case is meaningless without code, so require it here.
+            disabled={saving || !title.trim() || (isCreate && !playwrightCode.trim())}
             className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-1.5 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-60"
           >
             {saving ? (
@@ -228,7 +322,7 @@ export function EditCaseDialog({ open, onClose, caseData, onSaved }: Props) {
             ) : (
               <Save className="h-4 w-4" strokeWidth={1.75} />
             )}
-            Update case
+            {isCreate ? "Create case" : "Update case"}
           </button>
         </div>
       </ModalContent>

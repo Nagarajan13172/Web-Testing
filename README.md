@@ -22,6 +22,8 @@ and line coverage.
 - **GitHub App install** → repos synced into the dashboard (webhook signature verified).
 - **Framework detection** — deterministic, reads `package.json`. No AI cost.
 - **AI test generation** — 6–10 Vitest + RTL cases per repo, stored as editable test cases.
+- **Hand-written test cases** — write your own spec and run it on the same pipeline.
+  Needs no model quota and no GitHub App. See below for how these are protected.
 - **Sandboxed runs** — clone → inject specs under `tests/ai/` → run in Docker → parse
   JUnit back to per-case pass/fail with failure messages and stack traces.
 - **Self-repair** — a spec that fails goes back to the model with its actual error
@@ -123,6 +125,13 @@ Clerk and GitHub App keys are required for sign-in and repo sync respectively.
 | `pnpm sandbox:build` | Build the Node sandbox image used for test runs |
 
 ## Notes for contributors
+
+**Generated vs hand-written cases.** `test_cases.source` is `ai` or `manual`, and
+it gates three behaviours that are right for generated cases and destructive for
+hand-written ones. A `manual` case is never rewritten by the sanitizers, never
+sent to the AI repair pass, and never deleted by **Regenerate** — it runs exactly
+as written, and what you see stored is what ran. Anything new that mutates a
+case's code must check `source` first.
 
 **Generated-code sanitizers.** The model reliably produces a few broken patterns
 (nested `<Router>`, wrong relative import depth, `getByText` on text split across

@@ -105,9 +105,12 @@ export async function POST(
     return NextResponse.json({ error: "AI returned no test cases" }, { status: 502 });
   }
 
-  // Replace prior cases for this repo with the new set.
+  // Replace prior GENERATED cases for this repo with the new set. Manually
+  // written cases are the user's work and must survive a regenerate.
   await db.transaction(async (tx) => {
-    await tx.delete(testCases).where(eq(testCases.repoId, repo.id));
+    await tx
+      .delete(testCases)
+      .where(and(eq(testCases.repoId, repo.id), eq(testCases.source, "ai")));
     await tx.insert(testCases).values(
       generated.testCases.map((tc) => ({
         repoId: repo.id,

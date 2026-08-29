@@ -15,6 +15,7 @@ import {
   TrendingUp,
   Search,
   Box,
+  Plus,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { TestExecutionModal } from "@/components/test-execution-modal";
@@ -25,6 +26,7 @@ interface InitialCase {
   title: string;
   description: string;
   category: string;
+  source?: "ai" | "manual";
   status: "pending" | "running" | "passed" | "failed";
   lastRunAt: string | null;
   lastDurationMs: number | null;
@@ -73,6 +75,7 @@ export function RepoCard({ repoId, repoFullName, defaultBranch, initial, install
   const [detectHint, setDetectHint] = useState<string | null>(null);
   const autoDetectedRef = useRef(false);
   const [editingCase, setEditingCase] = useState<EditableCase | null>(null);
+  const [creating, setCreating] = useState(false);
 
   const isSupported =
     data.framework == null ? null : SUPPORTED_FRAMEWORKS.has(data.framework);
@@ -286,6 +289,7 @@ export function RepoCard({ repoId, repoFullName, defaultBranch, initial, install
                 generating={generating}
                 error={genError}
                 onGenerate={generate}
+                onAddManual={() => setCreating(true)}
               />
             ) : (
               <CaseList
@@ -295,6 +299,7 @@ export function RepoCard({ repoId, repoFullName, defaultBranch, initial, install
                 onToggleOne={toggleOne}
                 onRun={runSelected}
                 onRegenerate={generate}
+                onAddManual={() => setCreating(true)}
                 onEdit={async (c) => {
                   setEditingCase({
                     id: c.id,
@@ -334,6 +339,38 @@ export function RepoCard({ repoId, repoFullName, defaultBranch, initial, install
         )}
       </div>
     </details>
+
+    <EditCaseDialog
+      open={creating}
+      mode="create"
+      repoId={repoId}
+      caseData={null}
+      onClose={() => setCreating(false)}
+      onCreated={(created) =>
+        setData((d) => ({
+          ...d,
+          cases: [
+            ...d.cases,
+            {
+              id: created.id,
+              title: created.title,
+              description: created.description,
+              category: created.category,
+              source: "manual" as const,
+              status: "pending" as const,
+              lastRunAt: null,
+              lastDurationMs: null,
+              lastFailureMessage: null,
+              targetRoute: created.targetRoute,
+              expectedResult: created.expectedResult,
+              playwrightCode: created.playwrightCode,
+            },
+          ],
+          totals: { ...d.totals, total: d.totals.total + 1, pending: d.totals.pending + 1 },
+        }))
+      }
+      onSaved={() => undefined}
+    />
 
     <EditCaseDialog
       open={editingCase !== null}
@@ -392,11 +429,13 @@ function GenerateBlock({
   generating,
   error,
   onGenerate,
+  onAddManual,
 }: {
   installed: boolean;
   generating: boolean;
   error: string | null;
   onGenerate: () => void;
+  onAddManual: () => void;
 }) {
   return (
     <div className="mt-5 flex flex-col items-center rounded-md border border-dashed border-border bg-card/30 px-6 py-10 text-center">
@@ -426,6 +465,16 @@ function GenerateBlock({
           Install the GitHub App on this repo first.
         </p>
       )}
+      {/* Writing a case by hand needs no GitHub App and no model quota, so it
+          stays available even when generation is unavailable. */}
+      <button
+        type="button"
+        onClick={onAddManual}
+        className="mt-3 inline-flex items-center gap-1.5 text-xs text-muted-foreground underline-offset-4 transition-colors hover:text-foreground hover:underline"
+      >
+        <Plus className="h-3.5 w-3.5" strokeWidth={1.75} />
+        or write a test case yourself
+      </button>
       {error && (
         <p className="mt-3 max-w-sm break-words font-mono text-[11px] text-destructive">{error}</p>
       )}
@@ -441,6 +490,7 @@ function CaseList({
   onRun,
   onRegenerate,
   onEdit,
+  onAddManual,
   generating,
   runError,
 }: {
@@ -451,6 +501,7 @@ function CaseList({
   onRun: () => void;
   onRegenerate: () => void;
   onEdit: (c: InitialCase) => void;
+  onAddManual: () => void;
   generating: boolean;
   runError: string | null;
 }) {
@@ -458,8 +509,16 @@ function CaseList({
   return (
     <div className="mt-6">
       <div className="mb-2 flex items-center justify-between">
-        <h3 className="text-sm font-semibold tracking-tight text-primary">Generated test cases</h3>
+        <h3 className="text-sm font-semibold tracking-tight text-primary">Test cases</h3>
         <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={onAddManual}
+            className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground"
+          >
+            <Plus className="h-3 w-3" strokeWidth={1.75} />
+            Add test case
+          </button>
           <button
             type="button"
             onClick={onToggleAll}
@@ -503,6 +562,7 @@ function CaseList({
                 </div>
               )}
             </div>
+            {c.source === "manual" && <SourceBadge />}
             <CategoryBadge category={c.category} />
             <StatusBadge status={c.status} />
             <button
@@ -586,6 +646,18 @@ function StatCard({
         <Icon className="h-3.5 w-3.5" strokeWidth={1.75} />
       </div>
     </div>
+  );
+}
+
+/** Marks a hand-written case: it is never rewritten, repaired, or regenerated away. */
+function SourceBadge() {
+  return (
+    <span
+      title="Hand-written — runs exactly as you wrote it, and Regenerate won't delete it"
+      className="shrink-0 rounded border border-primary/40 bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-primary"
+    >
+      manual
+    </span>
   );
 }
 

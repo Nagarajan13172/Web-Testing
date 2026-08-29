@@ -29,6 +29,7 @@ export async function GET(
       title: testCases.title,
       description: testCases.description,
       category: testCases.category,
+      source: testCases.source,
       status: testCases.status,
       lastRunAt: testCases.lastRunAt,
       lastDurationMs: testCases.lastDurationMs,
@@ -61,6 +62,70 @@ export async function GET(
     cases,
     totals,
   });
+}
+
+interface CreateCaseBody {
+  title?: string;
+  description?: string;
+  category?: string;
+  code?: string;
+  targetRoute?: string | null;
+  expectedResult?: string | null;
+}
+
+/**
+ * Create a hand-written test case.
+ *
+ * Unlike generated cases this is stored verbatim — no sanitizer rewrites, and
+ * the runner will not send it to the repair pass. What the user wrote is what
+ * runs, and what they see afterwards.
+ */
+export async function POST(
+  req: Request,
+  { params }: { params: Promise<{ id: string }> },
+) {
+  const { id } = await params;
+  if (!isUuid(id)) {
+    return NextResponse.json({ error: "invalid repo id" }, { status: 400 });
+  }
+
+  const { org } = await requireUser();
+
+  const [repo] = await db
+    .select()
+    .from(repos)
+    .where(and(eq(repos.id, id), eq(repos.orgId, org.id)))
+    .limit(1);
+  if (!repo) return NextResponse.json({ error: "repo not found" }, { status: 404 });
+
+  const body = (await req.json().catch(() => null)) as CreateCaseBody | null;
+  if (!body) return NextResponse.json({ error: "invalid body" }, { status: 400 });
+
+  const title = body.title?.trim();
+  const code = body.code;
+  if (!title) {
+    return NextResponse.json({ error: "title is required" }, { status: 400 });
+  }
+  if (!code || !code.trim()) {
+    return NextResponse.json({ error: "code is required" }, { status: 400 });
+  }
+
+  const [created] = await db
+    .insert(testCases)
+    .values({
+      repoId: repo.id,
+      title,
+      description: body.description?.trim() ?? "",
+      category: body.category?.trim() || "component",
+      source: "manual",
+      status: "pending",
+      playwrightCode: code,
+      targetRoute: body.targetRoute?.trim() || null,
+      expectedResult: body.expectedResult?.trim() || null,
+    })
+    .returning();
+
+  return NextResponse.json({ case: created }, { status: 201 });
 }
 
 function isUuid(s: string) {

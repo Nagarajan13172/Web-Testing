@@ -60,9 +60,11 @@ export async function POST(
   const wasSupported = repo.testRunnerKind != null;
   let clearedCount = 0;
   if (wasSupported !== detection.supported) {
+    // Only generated cases are tied to the detected stack. Hand-written ones
+    // belong to the user and are never cleared on our say-so.
     const deleted = await db
       .delete(testCases)
-      .where(eq(testCases.repoId, repo.id))
+      .where(and(eq(testCases.repoId, repo.id), eq(testCases.source, "ai")))
       .returning({ id: testCases.id });
     clearedCount = deleted.length;
   }
