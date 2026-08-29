@@ -174,50 +174,6 @@ describe("spec syntax validation", () => {
   });
 });
 
-describe("adopting a generated case", () => {
-  async function makeGenerated(status: "pending" | "passed" = "pending") {
-    const [row] = await db.insert(testCases).values({
-      repoId: ctx.repoId, title: "generated", description: "", category: "component",
-      source: "ai", status, playwrightCode: SPEC,
-    }).returning();
-    return row!;
-  }
-  const patch = (id: string, body: unknown) =>
-    PATCH(new Request("http://localhost/x", {
-      method: "PATCH", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }), params(id));
-
-  it("flips source to manual", async () => {
-    const gen = await makeGenerated();
-    expect((await patch(gen.id, { source: "manual" })).status).toBe(200);
-    const [row] = await db.select().from(testCases).where(eq(testCases.id, gen.id));
-    expect(row!.source).toBe("manual");
-  });
-
-  // Adoption changes ownership, not what the case asserts — knocking a green
-  // case back to pending would misreport it as never having run.
-  it("does not reset a passing case to pending", async () => {
-    const gen = await makeGenerated("passed");
-    await patch(gen.id, { source: "manual" });
-    const [row] = await db.select().from(testCases).where(eq(testCases.id, gen.id));
-    expect(row!.status).toBe("passed");
-  });
-
-  it("still resets to pending when the spec itself changes", async () => {
-    const gen = await makeGenerated("passed");
-    await patch(gen.id, { title: "new requirements" });
-    const [row] = await db.select().from(testCases).where(eq(testCases.id, gen.id));
-    expect(row!.status).toBe("pending");
-  });
-
-  it("refuses to un-adopt, which would re-expose the case to rewrites", async () => {
-    const gen = await makeGenerated();
-    const res = await patch(gen.id, { source: "ai" });
-    expect(res.status).toBe(400);
-  });
-});
-
 describe("regeneration scoping", () => {
   it("deletes generated cases and preserves hand-written ones", async () => {
     await db.insert(testCases).values([

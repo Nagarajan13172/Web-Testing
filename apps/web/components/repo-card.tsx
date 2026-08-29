@@ -17,7 +17,6 @@ import {
   Box,
   Plus,
   Trash2,
-  Lock,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { TestExecutionModal } from "@/components/test-execution-modal";
@@ -214,25 +213,6 @@ export function RepoCard({ repoId, repoFullName, defaultBranch, initial, install
     }
   }
 
-  async function adoptCase(c: InitialCase) {
-    setRunError(null);
-    try {
-      const res = await fetch(`/api/test-cases/${c.id}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ source: "manual" }),
-      });
-      const json = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(json.error ?? `request failed: ${res.status}`);
-      setData((d) => ({
-        ...d,
-        cases: d.cases.map((x) => (x.id === c.id ? { ...x, source: "manual" as const } : x)),
-      }));
-    } catch (err) {
-      setRunError(err instanceof Error ? err.message : "could not adopt the case");
-    }
-  }
-
   const passRate =
     data.totals.total === 0
       ? 0
@@ -349,7 +329,6 @@ export function RepoCard({ repoId, repoFullName, defaultBranch, initial, install
                 onRegenerate={generate}
                 onAddManual={() => setCreating(true)}
                 onDelete={deleteCase}
-                onAdopt={adoptCase}
                 onEdit={async (c) => {
                   setEditingCase({
                     id: c.id,
@@ -541,7 +520,6 @@ function CaseList({
   onRegenerate,
   onEdit,
   onDelete,
-  onAdopt,
   onAddManual,
   generating,
   runError,
@@ -554,7 +532,6 @@ function CaseList({
   onRegenerate: () => void;
   onEdit: (c: InitialCase) => void;
   onDelete: (c: InitialCase) => void;
-  onAdopt: (c: InitialCase) => void;
   onAddManual: () => void;
   generating: boolean;
   runError: string | null;
@@ -619,16 +596,6 @@ function CaseList({
             {c.source === "manual" && <SourceBadge />}
             <CategoryBadge category={c.category} />
             <StatusBadge status={c.status} />
-            {c.source !== "manual" && (
-              <button
-                type="button"
-                onClick={() => onAdopt(c)}
-                title="Adopt — keep this exactly as it is: no AI rewrites, no repair, and Regenerate won't delete it"
-                className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border bg-background text-muted-foreground transition-colors hover:border-primary/40 hover:text-primary"
-              >
-                <Lock className="h-3 w-3" strokeWidth={1.75} />
-              </button>
-            )}
             <button
               type="button"
               onClick={() => onEdit(c)}
